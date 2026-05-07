@@ -18,34 +18,42 @@ claude --model opus
 
 ## 【最重要】Termux:API センサーの動作法則（2026-05-08 解明・確認済み）
 
-### 壊れる条件（絶対にやってはいけない）
+### 正しい停止方法（2026-05-08 確定）
 
-`termux-sensor -s gravity -d 500`（連続モード、-n なし）を起動した後、
-**SIGTERM・SIGKILL・pkill で止めると binder 接続が永久に壊れる。**
-
-壊れると：
-- `termux-sensor -s "Gravity" -n 1` を含め一切のセンサーコマンドがタイムアウト
-- Termux:API アプリを開き直しても復旧しない
-- **電話の再起動だけが復旧手段**（または `am force-stop com.termux.api` が有効な場合あり）
-
-### 壊れない条件
-
-- `termux-sensor -s gravity -n 1`（有限モード）は何回呼んでも安全
-- 連続モードの Popen は 1セッション中に **1回だけ** 起動し、途中で止めない
-- Python プロセスが自然終了すれば子プロセスは SIGPIPE で安全に死ぬ（terminate 不要）
-
-### calibrate.py の正しい設計（1セッション設計）
-
-```
-termux-sensor を1回だけ Popen 起動
-  → バックグラウンドスレッドで全サンプルを (時刻, Z値) に蓄積し続ける
-  → 着席フェーズ：開始時刻・終了時刻を記録（terminate しない）
-  → 離席フェーズ：同じ Popen から継続（terminate しない）
-  → Python exit → 子プロセスが SIGPIPE で自然死（明示的 terminate 不要）
-  → 時間窓でサンプルを切り出して集計
+```bash
+# Python コードから
+import signal
+proc.send_signal(signal.SIGINT)        # ← SIGINT が正解
+proc.wait(timeout=5)
+subprocess.run(["termux-sensor", "-c"])  # リスナー解放の念押し
 ```
 
-途中で Popen を止め直すような変更は絶対に入れないこと。
+SIGINT を受けると termux-sensor は以下を出力して安全に終了する：
+```
+^CCaught interrupt.. Finishing...
+Performing sensor cleanup
+Sensor cleanup successful!
+```
+
+### 壊れる操作（絶対禁止）
+
+- `proc.terminate()` / `proc.kill()` → SIGTERM/SIGKILL → binder 破壊
+- `pkill -f termux-sensor` → binder 破壊
+
+### binder が壊れたときの復旧（再起動不要）
+
+```bash
+termux-sensor -c          # → "Sensor cleanup successful!" が出れば復旧
+termux-sensor -s "Gravity" -n 1   # 動作確認
+```
+
+`-c` も応答しない場合：設定 → アプリ → アプリ管理 → Termux:API → **強制停止**（GUIから）
+
+### calibrate.py の設計（実装済み）
+
+フェーズごとに `subprocess.run -n 20`（10秒）の独立セッションを使い、
+`finally` ブロックで `termux-sensor -c` を呼んでリスナーを毎回解放する。
+これにより何度でも連続実行できる。
 
 ---
 
