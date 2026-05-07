@@ -144,25 +144,18 @@ def main() -> None:
     print(f"  各フェーズ: -n {N_SAMPLES} ({N_SAMPLES * INTERVAL_MS // 1000}秒) + -c クリーンアップ")
     print("=" * 50)
 
-    # 競合プロセスが存在する場合は EXIT（kill はしない）
+    # main.py が動いていたら EXIT（kill はしない）
     _log("\n[準備] 競合プロセスを確認...")
-    conflicts: list[str] = []
-    for pat in ["main.py", "termux-sensor"]:
-        r = subprocess.run(["pgrep", "-f", pat], capture_output=True, text=True)
-        pids = r.stdout.strip()
-        if pids:
-            conflicts.append(f"  {pat}: PID={pids}")
-
-    if conflicts:
-        _log("[ERROR] 以下のプロセスが動いています。")
-        for c in conflicts:
-            _log(c)
-        _log("\n停止方法:")
-        _log("  main.py    → Ctrl+C で止める")
-        _log("  termux-sensor → termux-sensor -c でリスナー解放 → 自然に消える")
+    r = subprocess.run(["pgrep", "-f", "main.py"], capture_output=True, text=True)
+    if r.stdout.strip():
+        _log(f"[ERROR] main.py が動いています（PID={r.stdout.strip()}）。")
+        _log("  Ctrl+C で停止してから再実行してください。")
         sys.exit(1)
 
-    _log("  競合プロセスなし → 続行\n")
+    # termux-sensor の残留リスナーを -c で解放してから開始
+    _log("[準備] termux-sensor -c でリスナーをクリーンアップ...")
+    _sensor_cleanup()
+    _log("  完了 → 続行\n")
 
     # フェーズ1: 着席
     seated_z = collect_phase(
