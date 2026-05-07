@@ -23,23 +23,32 @@ COLLECT_SEC = 10
 INTERVAL_MS = 500
 
 
-def read_sensor_samples(label: str, duration_sec: int) -> list[float]:
+def read_sensor_samples(label: str, duration_sec: int, pre_delay_sec: int = 0) -> list[float]:
     """termux-sensor を起動して duration_sec 秒分のZ値を収集する。"""
     print(f"\n{'='*50}")
-    print(f"【{label}】の状態でじっとしてください。")
+    print(f"【{label}】")
     input("準備ができたら Enter を押してください...")
+
+    if pre_delay_sec > 0:
+        print(f"{pre_delay_sec}秒後に収集開始します。その間に所定の位置についてください。", flush=True)
+        for i in range(pre_delay_sec, 0, -1):
+            print(f"  {i}秒...", flush=True)
+            time.sleep(1)
+
     print(f"{duration_sec}秒間データを収集します...", flush=True)
+
+    # 前回のプロセスを終了してセンサーを解放してから起動
+    try:
+        subprocess.run(["pkill", "-f", "termux-sensor"], timeout=3)
+    except Exception:
+        pass
+    time.sleep(1.5)  # センサーが解放されるまで待つ
 
     cmd = ["termux-sensor", "-s", "gravity", "-d", str(INTERVAL_MS)]
     z_values: list[float] = []
     buf: list[str] = []
     depth = 0
     start = time.monotonic()
-
-    try:
-        subprocess.run(["pkill", "-f", "termux-sensor"], timeout=3)
-    except Exception:
-        pass
 
     try:
         proc = subprocess.Popen(
@@ -129,8 +138,16 @@ def main() -> None:
     print("=" * 50)
     print("スマホをクッションの下（実際の使用位置）に置いた状態で実行してください。")
 
-    seated_z = read_sensor_samples("着席中（座ってください）", COLLECT_SEC)
-    left_z = read_sensor_samples("離席中（席を離れてください）", COLLECT_SEC)
+    seated_z = read_sensor_samples(
+        "着席中: スマホをクッション下に置いて座ってください",
+        COLLECT_SEC,
+        pre_delay_sec=3,
+    )
+    left_z = read_sensor_samples(
+        "離席中: Enter後5秒で収集開始します。その間にその場を離れてください",
+        COLLECT_SEC,
+        pre_delay_sec=5,
+    )
 
     if not seated_z or not left_z:
         print("[ERROR] データが取得できませんでした。")
