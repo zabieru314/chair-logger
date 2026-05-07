@@ -82,8 +82,9 @@ class SensorMonitor:
         self._candidate_state: Optional[str] = None
         self._candidate_since: Optional[float] = None
 
-        # 振動バッファ（magnitudeを直近VIBRATION_BUFFER_SIZE個保持）
+        # 振動バッファ（連続サンプル間のdeltaを直近VIBRATION_BUFFER_SIZE個保持）
         self._magnitude_buffer: Deque[float] = deque(maxlen=VIBRATION_BUFFER_SIZE)
+        self._prev_magnitude: Optional[float] = None  # 前回のmagnitude
         self._latest_stddev: Optional[float] = None
         self._last_status_log_at: float = 0.0
 
@@ -213,7 +214,7 @@ class SensorMonitor:
     def _run_sensor_once(self) -> None:
         """termux-sensor を1回起動して、終了するまで読み続ける。"""
         cfg = self.config
-        cmd = ["termux-sensor", "-s", "Linear Acceleration Sensor", "-d", str(cfg.sensor_interval_ms)]
+        cmd = ["termux-sensor", "-s", "Gravity Sensor", "-d", str(cfg.sensor_interval_ms)]
 
         logger.info(f"termux-sensor を起動: {' '.join(cmd)}")
         try:
@@ -280,16 +281,15 @@ class SensorMonitor:
             logger.debug(f"JSON最上位がdictでない: {type(data)}")
             return
 
-        # キー名は大文字小文字を無視して "linear acceleration" または "accelerometer" を含むものを拾う
+        # キー名は大文字小文字を無視して "gravity" を含むものを拾う
         sensor = None
         for key in data:
-            kl = key.lower()
-            if "linear acceleration" in kl or "accelerometer" in kl:
+            if "gravity" in key.lower():
                 sensor = data[key]
                 break
 
         if not isinstance(sensor, dict):
-            logger.warning(f"加速度センサーキーが見つからない。キー一覧: {list(data.keys())}")
+            logger.warning(f"gravityキーが見つからない。キー一覧: {list(data.keys())}")
             return
 
         values = sensor.get("values")
@@ -303,6 +303,7 @@ class SensorMonitor:
                 return
 
             magnitude = math.sqrt(x * x + y * y + z * z)
+            # 前回との差分（振動の強さ）をハンドラに渡す
             self._handle_magnitude(magnitude)
         else:
             logger.warning(f"valuesが不正: {values!r}")
@@ -321,25 +322,29 @@ class SensorMonitor:
         now = time.monotonic()
 
         with self._state_lock:
-            self._magnitude_buffer.append(magnitude)
+            # 連続サンプル間の差分をバッファに積む（初回は差分なし）
+            if self._prev_magnitude is not None:
+                delta = abs(magnitude - self._prev_magnitude)
+                self._magnitude_buffer.append(delta)
+            self._prev_magnitude = magnitude
 
             if len(self._magnitude_buffer) < 2:
                 return
 
-            avg_mag = sum(self._magnitude_buffer) / len(self._magnitude_buffer)
-            self._latest_stddev = avg_mag  # 互換のため同フィールドに格納
+            avg_delta = sum(self._magnitude_buffer) / len(self._magnitude_buffer)
+            self._latest_stddev = avg_delta  # 互換フィールドに格納
 
-            # 平均magnitudeが閾値以上 → 動きあり = 着席中
-            # 平均magnitudeが閾値未満 → 静止 = 離席中
+            # 平均delta（変化量）が閾値以上 → 振動あり = 着席中
+            # 平均delta（変化量）が閾値未満 → 静止 = 離席中
             observed = (
-                STATUS_SEATED if avg_mag >= cfg.vibration_threshold else STATUS_LEFT
+                STATUS_SEATED if avg_delta >= cfg.vibration_threshold else STATUS_LEFT
             )
 
             # 5秒ごとに現状をINFOログへ
             if now - self._last_status_log_at >= STATUS_LOG_INTERVAL_SEC:
                 self._last_status_log_at = now
                 logger.info(
-                    f"[判定] avg_mag={avg_mag:.4f} 閾値={cfg.vibration_threshold} "
+                    f"[判定] avg_delta={avg_delta:.4f} 閾値={cfg.vibration_threshold} "
                     f"observed={observed} confirmed={self._confirmed_state} "
                     f"samples={len(self._magnitude_buffer)}"
                 )
