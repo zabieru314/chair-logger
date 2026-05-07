@@ -58,26 +58,27 @@ def kill_by_pidfile(pid_file: str) -> None:
         print(f"[WARN] PIDファイルkill失敗: {e}")
 
 
-def kill_by_ss(port: int) -> None:
-    """ss コマンドでポートを使っているプロセスをkillする。"""
+def kill_by_ps(script_name: str) -> None:
+    """ps で同名スクリプトの旧プロセスをkillする（停止状態も含む）。"""
     import re
     import subprocess
     try:
         result = subprocess.run(
-            ["ss", "-tlnp", f"sport = :{port}"],
+            ["ps", "-ef"],
             capture_output=True, text=True, timeout=5
         )
-        m = re.search(r'pid=(\d+)', result.stdout)
-        if m:
-            pid = int(m.group(1))
-            if pid != os.getpid():
-                os.kill(pid, signal.SIGKILL)
-                print(f"[INFO] ポート{port}を使用中のPID={pid} をkillしました（ss）")
-                time.sleep(1)
-    except FileNotFoundError:
-        pass  # ss コマンドがない環境では無視
+        my_pid = os.getpid()
+        for line in result.stdout.splitlines():
+            if script_name in line and "grep" not in line:
+                m = re.search(r'\s+(\d+)\s+', line)
+                if m:
+                    pid = int(m.group(1))
+                    if pid != my_pid:
+                        os.kill(pid, signal.SIGKILL)
+                        print(f"[INFO] 旧プロセス PID={pid} をkillしました（ps）")
+                        time.sleep(1)
     except Exception as e:
-        print(f"[WARN] ssコマンドkill失敗: {e}")
+        print(f"[WARN] psコマンドkill失敗: {e}")
 
 
 def write_pidfile(pid_file: str) -> None:
@@ -233,7 +234,7 @@ def main() -> int:
     # 前回のプロセスをkillしてからFlask起動（PIDファイル→ssの順で試みる）
     pid_file = str(PROJECT_ROOT / "logs" / "main.pid")
     kill_by_pidfile(pid_file)
-    kill_by_ss(web_cfg["port"])
+    kill_by_ps("main.py")
     write_pidfile(pid_file)
     app = create_app(sensor_cfg.db_path, monitor=monitor)
     try:
