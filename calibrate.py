@@ -1,17 +1,15 @@
 """
-閾値キャリブレーションスクリプト（デバッグ強化版）
+閾値キャリブレーションスクリプト（1セッション版）
 
-使い方:
-  1. main.py を Ctrl+C で停止してから
-  2. python calibrate.py を同じセッションで実行
+【設計方針】
+  termux-sensor を1回だけ起動し、同一の Popen ストリームから
+  着席・離席の両サンプルを連続収集する。
+  途中で proc.terminate() を呼ばないことで Termux:API 接続を保護する。
 """
 
 from __future__ import annotations
 
 import json
-import os
-import select
-import signal
 import statistics
 import subprocess
 import sys
@@ -25,186 +23,47 @@ COLLECT_SEC = 10
 INTERVAL_MS = 500
 
 
-# ---------------------------------------------------------------
-# デバッグユーティリティ
-# ---------------------------------------------------------------
-
 def _log(msg: str) -> None:
     print(msg, flush=True)
 
 
-def _kill_all_sensor_procs() -> None:
-    """termux-sensor プロセスを全て SIGTERM → 1秒待ち → SIGKILL で確実に終了。"""
-    result = subprocess.run(["pgrep", "-f", "termux-sensor"], capture_output=True, text=True)
-    pids = [int(p) for p in result.stdout.split() if p.strip().isdigit()]
-    if not pids:
-        _log("  [DBG] 残留 termux-sensor なし")
-        return
-    for pid in pids:
-        try:
-            os.kill(pid, signal.SIGTERM)
-            _log(f"  [DBG] SIGTERM → PID={pid}")
-        except ProcessLookupError:
-            pass
-    time.sleep(1.0)
-    for pid in pids:
-        try:
-            os.kill(pid, signal.SIGKILL)
-            _log(f"  [DBG] SIGKILL → PID={pid} (残留していた場合)")
-        except ProcessLookupError:
-            pass  # SIGTERM で既に死んでいれば正常
-    time.sleep(1.5)
+
+def _countdown(seconds: int) -> None:
+    for i in range(seconds, 0, -1):
+        _log(f"  {i}秒...")
+        time.sleep(1)
 
 
-def _preflight_check() -> None:
-    """センサー応答を複数の名前で試す。"""
-    _log("\n[事前確認] 各センサー名で -n 1 テスト...")
-    for name in ["gravity", "Gravity Sensor", "Gravity"]:
-        _log(f"  → name={name!r} ...")
-        try:
-            r = subprocess.run(
-                ["termux-sensor", "-s", name, "-n", "1"],
-                capture_output=True, text=True, timeout=5
-            )
-            _log(f"     returncode={r.returncode}")
-            _log(f"     stdout={r.stdout[:200]!r}")
-            _log(f"     stderr={r.stderr[:200]!r}")
-        except subprocess.TimeoutExpired:
-            _log(f"     [TO] タイムアウト（5秒で無応答）")
-        except Exception as e:
-            _log(f"     [ERR] {e}")
-
-
-# ---------------------------------------------------------------
-# サンプル収集
-# ---------------------------------------------------------------
-
-def read_sensor_samples(label: str, duration_sec: int, pre_delay_sec: int = 0) -> list[float]:
+def _collect_window(
+    all_samples: list[tuple[float, float]],
+    label: str,
+    pre_delay_sec: int,
+) -> tuple[float, float]:
+    """ユーザーにカウントダウンを見せ、収集ウィンドウの開始・終了時刻を返す。"""
     print(f"\n{'='*50}")
     print(f"【{label}】")
-    input("準備ができたら Enter を押してください...")
+    input("準備ができたら Enter を押してください... ")
 
     if pre_delay_sec > 0:
-        print(f"{pre_delay_sec}秒後に収集開始します。", flush=True)
-        for i in range(pre_delay_sec, 0, -1):
-            print(f"  {i}秒...", flush=True)
-            time.sleep(1)
+        _log(f"{pre_delay_sec}秒後に収集開始します。")
+        _countdown(pre_delay_sec)
 
-    print(f"{duration_sec}秒間データを収集します...", flush=True)
-
-    _kill_all_sensor_procs()
-
-    cmd = ["termux-sensor", "-s", "gravity", "-d", str(INTERVAL_MS)]
-    z_values: list[float] = []
-    buf: list[str] = []
-    depth = 0
+    _log(f"{COLLECT_SEC}秒間データを収集します...")
     start = time.monotonic()
+    snapshot = len(all_samples)
 
-    _log(f"  [DBG] Popen起動: {' '.join(cmd)}")
-    _log(f"  [DBG] 環境: PATH={os.environ.get('PATH','')[:80]}")
-
-    try:
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            bufsize=1,
-            env=os.environ.copy(),
-        )
-        _log(f"  [DBG] PID={proc.pid}")
-
-        # stderr を別スレッドで読んでリアルタイム表示
-        stderr_lines: list[str] = []
-        def _read_stderr() -> None:
-            assert proc.stderr
-            for line in proc.stderr:
-                msg = line.rstrip()
-                stderr_lines.append(msg)
-                _log(f"  [ERR] {msg}")
-        threading.Thread(target=_read_stderr, daemon=True).start()
-
-        # 最初の5秒でデータが来るか select で確認
-        _log("  [DBG] 最初の5秒でstdoutにデータが来るか確認...")
-        assert proc.stdout
-        readable, _, _ = select.select([proc.stdout], [], [], 5.0)
-        if not readable:
-            _log(f"  [NG] 5秒経過してもstdoutにデータなし（プロセス生存: {proc.poll() is None}）")
-            if proc.poll() is not None:
-                _log(f"  [DBG] プロセス終了コード: {proc.returncode}")
-            proc.terminate()
-            proc.wait(timeout=3)
-            return z_values
+    for sec in range(1, COLLECT_SEC + 1):
+        time.sleep(1)
+        total_new = len(all_samples) - snapshot
+        latest_z = all_samples[-1][1] if all_samples else None
+        if latest_z is not None:
+            _log(f"  {sec:2d}秒経過 / 収集{total_new}件 / 最新Z={latest_z:.3f}")
         else:
-            _log("  [OK] stdoutにデータ到着！読み取り開始")
+            _log(f"  {sec:2d}秒経過 / 収集{total_new}件 / データ待ち...")
 
-        # 通常読み取りループ
-        line_count = 0
-        for line in proc.stdout:
-            line_count += 1
-            if line_count <= 8:
-                _log(f"  [生出力 L{line_count}] {line.rstrip()}")
-            if time.monotonic() - start >= duration_sec:
-                break
+    end = time.monotonic()
+    return start, end
 
-            buf.append(line)
-            depth += line.count("{") - line.count("}")
-            if depth <= 0 and buf:
-                block = "".join(buf).strip()
-                buf.clear()
-                depth = 0
-                if not block:
-                    continue
-                try:
-                    data = json.loads(block)
-                except json.JSONDecodeError as e:
-                    _log(f"  [DBG] JSONパース失敗: {e} block={block[:60]!r}")
-                    continue
-
-                sensor = None
-                for key in data:
-                    if "gravity" in key.lower():
-                        sensor = data[key]
-                        break
-                if not isinstance(sensor, dict):
-                    _log(f"  [DBG] gravityキー見つからず keys={list(data.keys())}")
-                    continue
-
-                values = sensor.get("values")
-                if isinstance(values, list) and len(values) >= 3:
-                    try:
-                        z = float(values[2])
-                        z_values.append(z)
-                        print(f"  サンプル {len(z_values):2d}: Z={z:.3f}", flush=True)
-                    except (TypeError, ValueError) as e:
-                        _log(f"  [DBG] Z値変換失敗: {e}")
-                else:
-                    _log(f"  [DBG] values不正: {values!r}")
-
-    except FileNotFoundError:
-        _log("[ERROR] termux-sensor が見つかりません。")
-        sys.exit(1)
-    finally:
-        try:
-            proc.terminate()
-            proc.wait(timeout=3)
-        except Exception:
-            try:
-                proc.kill()
-            except Exception:
-                pass
-
-    if not z_values:
-        _log("  [NG] サンプル0件")
-    else:
-        _log(f"  [OK] {len(z_values)}件取得完了")
-
-    return z_values
-
-
-# ---------------------------------------------------------------
-# .env 更新
-# ---------------------------------------------------------------
 
 def update_env(threshold: float) -> None:
     if not ENV_FILE.exists():
@@ -224,67 +83,148 @@ def update_env(threshold: float) -> None:
     _log(f"✓ .env を更新しました: Z_THRESHOLD={threshold:.3f}")
 
 
-# ---------------------------------------------------------------
-# メイン
-# ---------------------------------------------------------------
-
 def main() -> None:
     print("=" * 50)
-    print("  着席検知システム 閾値キャリブレーション（Z軸版）")
+    print("  着席検知システム 閾値キャリブレーション")
+    print("  ※ termux-sensor は1回起動して着席・離席を連続収集します")
     print("=" * 50)
-    print("※ main.py を先に Ctrl+C で停止してから実行してください")
-    print(f"  実行PID={os.getpid()} / Python={sys.executable}", flush=True)
-
-    # 残留プロセス確認
-    _log("\n[準備] 残留プロセス確認...")
+    # 競合プロセスが存在する場合は EXIT（kill はしない）
+    _log("\n[準備] 競合プロセスを確認...")
+    conflicts: list[str] = []
     for pat in ["main.py", "termux-sensor"]:
         r = subprocess.run(["pgrep", "-f", pat], capture_output=True, text=True)
         pids = r.stdout.strip()
-        _log(f"  {pat}: PID={pids if pids else 'なし'}")
+        if pids:
+            conflicts.append(f"  {pat}: PID={pids}")
 
-    # Python プロセスを全て強制終了（自分自身を除く）
-    _log("\n[準備] Python / termux-sensor を全て強制終了...")
-    my_pid = os.getpid()
-    r = subprocess.run(["pgrep", "-f", "python"], capture_output=True, text=True)
-    for p in r.stdout.split():
-        pid = int(p)
-        if pid != my_pid:
-            try:
-                os.kill(pid, signal.SIGKILL)
-                _log(f"  SIGKILL → python PID={pid}")
-            except ProcessLookupError:
-                pass
-    _kill_all_sensor_procs()
+    if conflicts:
+        _log("[ERROR] 以下のプロセスが動いています。先に Ctrl+C で停止してください：")
+        for c in conflicts:
+            _log(c)
+        _log("\n⚠️  pkill -9 や kill -9 は使わないこと（Termux:API が壊れる）。")
+        _log("   必ず Ctrl+C か Ctrl+\\ で止めてから再実行してください。")
+        sys.exit(1)
 
-    _log("\n" + "!"*50)
-    _log("！！！ここで Android ホーム画面から「Termux:API」アプリを開いてください！！！")
-    _log("  → アプリを開いて1〜2秒待つと Termux:API のセンサー接続がリセットされます")
-    _log("!"*50)
-    input("\nTermux:API を開いたら Enter を押してください...")
-    time.sleep(3)
+    _log("  競合プロセスなし → 続行")
 
-    # 事前センサー確認
-    _preflight_check()
+    # ---------------------------------------------------------------
+    # termux-sensor を1回だけ起動
+    # ---------------------------------------------------------------
+    cmd = ["termux-sensor", "-s", "gravity", "-d", str(INTERVAL_MS)]
+    _log(f"\n[起動] {' '.join(cmd)}")
 
-    _log("\n[準備完了] キャリブレーションを開始します。\n")
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+        )
+    except FileNotFoundError:
+        _log("[ERROR] termux-sensor が見つかりません。")
+        sys.exit(1)
 
-    seated_z = read_sensor_samples(
+    _log(f"  PID={proc.pid}")
+
+    # バックグラウンドスレッドで全サンプルを (time, z) のリストに蓄積
+    all_samples: list[tuple[float, float]] = []
+
+    def _reader() -> None:
+        assert proc.stdout
+        buf: list[str] = []
+        depth = 0
+        for line in proc.stdout:
+            buf.append(line)
+            depth += line.count("{") - line.count("}")
+            if depth <= 0 and buf:
+                block = "".join(buf).strip()
+                buf.clear()
+                depth = 0
+                if not block:
+                    continue
+                try:
+                    data = json.loads(block)
+                except json.JSONDecodeError:
+                    continue
+                for key in data:
+                    if "gravity" in key.lower():
+                        sensor = data[key]
+                        if isinstance(sensor, dict):
+                            values = sensor.get("values")
+                            if isinstance(values, list) and len(values) >= 3:
+                                try:
+                                    z = float(values[2])
+                                    all_samples.append((time.monotonic(), z))
+                                except (TypeError, ValueError):
+                                    pass
+                        break
+
+    threading.Thread(target=_reader, daemon=True).start()
+
+    def _stderr_reader() -> None:
+        assert proc.stderr
+        for line in proc.stderr:
+            _log(f"  [STDERR] {line.rstrip()}")
+
+    threading.Thread(target=_stderr_reader, daemon=True).start()
+
+    # 最初のデータが来るまで最大5秒待機
+    _log("  データ到着確認中（最大5秒）...")
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        if all_samples:
+            _log(f"  [OK] データ到着！ 最初のZ={all_samples[0][1]:.3f}")
+            break
+        time.sleep(0.1)
+    else:
+        _log("  [NG] 5秒待ってもデータが来ません。Termux:API を確認してください。")
+        try:
+            proc.terminate()
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        sys.exit(1)
+
+    # ---------------------------------------------------------------
+    # フェーズ1: 着席サンプル収集
+    # ---------------------------------------------------------------
+    seated_start, seated_end = _collect_window(
+        all_samples,
         "着席中: スマホをクッション下に置いて座ってください",
-        COLLECT_SEC, pre_delay_sec=3,
+        pre_delay_sec=3,
     )
-    left_z = read_sensor_samples(
+
+    # ---------------------------------------------------------------
+    # フェーズ2: 離席サンプル収集（同じ Popen から継続）
+    # ---------------------------------------------------------------
+    left_start, left_end = _collect_window(
+        all_samples,
         "離席中: Enter後5秒で収集開始。その間にその場を離れてください",
-        COLLECT_SEC, pre_delay_sec=5,
+        pre_delay_sec=5,
     )
+
+    # ---------------------------------------------------------------
+    # 時間窓でサンプルを切り出して集計
+    # ---------------------------------------------------------------
+    seated_z = [z for t, z in all_samples if seated_start <= t <= seated_end]
+    left_z = [z for t, z in all_samples if left_start <= t <= left_end]
+
+    _log(f"\n[集計] 着席: {len(seated_z)}件 / 離席: {len(left_z)}件")
 
     if not seated_z or not left_z:
-        _log("[ERROR] データが取得できませんでした。")
+        _log("[ERROR] サンプルが不足しています。")
+        if not seated_z:
+            _log("  → 着席サンプルが0件です")
+        if not left_z:
+            _log("  → 離席サンプルが0件です")
         sys.exit(1)
 
     seated_mean = statistics.mean(seated_z)
     left_mean = statistics.mean(left_z)
 
-    print("\n" + "="*50)
+    print("\n" + "=" * 50)
     print("【結果】")
     print(f"  着席中のZ平均: {seated_mean:.3f}  (サンプル数: {len(seated_z)})")
     print(f"  離席中のZ平均: {left_mean:.3f}  (サンプル数: {len(left_z)})")
