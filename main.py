@@ -157,7 +157,7 @@ def load_config() -> tuple[SensorConfig, dict]:
     sensor_cfg = SensorConfig(
         db_path=db_path,
         webhook_url=os.getenv("WEBHOOK_URL") or None,
-        vibration_threshold=_get_float("VIBRATION_THRESHOLD", 0.3),
+        z_threshold=_get_float("Z_THRESHOLD", 5.0),
         debounce_delay_sec=_get_float("DEBOUNCE_DELAY_SEC", 5.0),
         max_temp_celsius=_get_float("MAX_TEMP_CELSIUS", 40.0),
         cooldown_sleep_sec=_get_int("COOLDOWN_SLEEP_SEC", 300),
@@ -194,7 +194,7 @@ def main() -> int:
 
     logger.info(
         f"設定: db={sensor_cfg.db_path} "
-        f"vibration_th={sensor_cfg.vibration_threshold} "
+        f"z_threshold={sensor_cfg.z_threshold} "
         f"debounce={sensor_cfg.debounce_delay_sec}s "
         f"sensor_interval={sensor_cfg.sensor_interval_ms}ms "
         f"max_temp={sensor_cfg.max_temp_celsius}℃ "

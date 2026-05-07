@@ -3,12 +3,11 @@
 
 【絶対厳守の設計方針】
 - ポーリング厳禁。`subprocess.run` で繰り返し呼ぶのは熱暴走の原因になるためNG。
-- `termux-sensor -s accelerometer -d 500` を `subprocess.Popen` で1回だけ起動し、
+- `termux-sensor -s gravity -d 500` を `subprocess.Popen` で1回だけ起動し、
   標準出力をストリームとして1行ずつ非同期に読み取る。
-- 加速度センサーのmagnitude（√(x²+y²+z²)）を直近20サンプル（約10秒分）バッファし、
-  その標準偏差を「振動の強さ」として状態判定する。
-    - 標準偏差 ≥ VIBRATION_THRESHOLD → 着席中（vibrating = seated）
-    - 標準偏差 < VIBRATION_THRESHOLD → 離席中（still = left）
+- 重力センサーのZ軸値で着席を判定する。
+    - Z ≥ Z_THRESHOLD → 着席中（スマホが水平 = クッションに押し付けられている）
+    - Z < Z_THRESHOLD → 離席中（スマホが傾いている）
 - 状態が変化してから DEBOUNCE_DELAY_SEC 秒の間その状態が継続した場合のみ
   「確定」とみなす（チャタリング対策）。
 - 温度監視スレッドが「休止指示」を出している間は、Popen を一旦終了させ、
@@ -19,14 +18,11 @@ from __future__ import annotations
 
 import json
 import logging
-import math
-import statistics
 import subprocess
 import threading
 import time
-from collections import deque
 from dataclasses import dataclass
-from typing import Deque, Optional
+from typing import Optional
 
 from src.db import models as db_models
 from src.utils import hardware, notifier
@@ -38,10 +34,7 @@ logger = logging.getLogger(__name__)
 STATUS_SEATED = "seated"
 STATUS_LEFT = "left"
 
-# 振動バッファのサイズ（直近20サンプル ≒ 500ms × 20 = 10秒分）
-VIBRATION_BUFFER_SIZE = 20
-
-# 標準偏差・状態の定期ログ出力間隔（秒）
+# 状態の定期ログ出力間隔（秒）
 STATUS_LOG_INTERVAL_SEC = 5.0
 
 
@@ -49,7 +42,7 @@ STATUS_LOG_INTERVAL_SEC = 5.0
 class SensorConfig:
     db_path: str
     webhook_url: Optional[str]
-    vibration_threshold: float
+    z_threshold: float
     debounce_delay_sec: float
     max_temp_celsius: float
     cooldown_sleep_sec: int
@@ -59,45 +52,35 @@ class SensorConfig:
 
 class SensorMonitor:
     """
-    加速度センサーをストリームで読み続け、振動の強さ（magnitudeの標準偏差）から
+    重力センサーのZ軸値をストリームで読み続け、Z値の大小から
     着席/離席を判定し、Debounce後に状態確定するモニター。
 
     状態機械:
-        confirmed_state    : 直近で確定済みの状態（初期値 None）
-        candidate_state    : 観測中の遷移候補（None の時は遷移待ちでない）
-        candidate_since    : candidate_state を最初に観測した時刻
+        confirmed_state : 直近で確定済みの状態（初期値 None）
+        candidate_state : 観測中の遷移候補（None の時は遷移待ちでない）
+        candidate_since : candidate_state を最初に観測した時刻
 
     確定条件:
         candidate_state が DEBOUNCE_DELAY_SEC 以上継続して観測されたら
         confirmed_state に昇格させ、DBへ書き込み + Webhook通知。
     """
 
-    # termux-sensor の出力は values が複数行に分かれるため、JSONブロック単位でパースする
-
     def __init__(self, config: SensorConfig):
         self.config = config
 
-        # 確定状態 / 候補状態
         self._confirmed_state: Optional[str] = None
         self._candidate_state: Optional[str] = None
         self._candidate_since: Optional[float] = None
 
-        # 振動バッファ（連続サンプル間のdeltaを直近VIBRATION_BUFFER_SIZE個保持）
-        self._magnitude_buffer: Deque[float] = deque(maxlen=VIBRATION_BUFFER_SIZE)
-        self._prev_magnitude: Optional[float] = None  # 前回のmagnitude
-        self._latest_stddev: Optional[float] = None
+        self._latest_z: Optional[float] = None
         self._last_status_log_at: float = 0.0
 
-        # 制御フラグ
         self._stop_event = threading.Event()
-        self._cooldown_event = threading.Event()  # set されている間は休止
+        self._cooldown_event = threading.Event()
         self._state_lock = threading.Lock()
 
-        # サブスレッド
         self._sensor_thread: Optional[threading.Thread] = None
         self._temp_thread: Optional[threading.Thread] = None
-
-        # Popen ハンドル
         self._proc: Optional[subprocess.Popen] = None
 
     # ------------------------------------------------------------------
@@ -105,7 +88,6 @@ class SensorMonitor:
     # ------------------------------------------------------------------
 
     def start(self) -> None:
-        """センサー監視スレッドと温度監視スレッドを起動する。"""
         if self._sensor_thread and self._sensor_thread.is_alive():
             logger.warning("SensorMonitor は既に起動済みです。")
             return
@@ -125,7 +107,6 @@ class SensorMonitor:
         logger.info("SensorMonitor 起動完了")
 
     def stop(self) -> None:
-        """監視を停止する。"""
         logger.info("SensorMonitor 停止要求を受信")
         self._stop_event.set()
         self._terminate_proc()
@@ -137,8 +118,8 @@ class SensorMonitor:
                 "confirmed_state": self._confirmed_state,
                 "candidate_state": self._candidate_state,
                 "candidate_since": self._candidate_since,
-                "latest_z": self._latest_stddev,  # 互換: テンプレート側で「最新値」として表示
-                "latest_stddev": self._latest_stddev,
+                "latest_z": self._latest_z,
+                "latest_stddev": self._latest_z,  # テンプレート互換フィールド
                 "is_cooldown": self._cooldown_event.is_set(),
             }
 
@@ -147,10 +128,6 @@ class SensorMonitor:
     # ------------------------------------------------------------------
 
     def _temp_loop(self) -> None:
-        """
-        定期的にバッテリー温度をチェックし、上限超過時は休止フラグを立てる。
-        termux-battery-status が使えない環境（Termux:API 未インストール等）では即終了する。
-        """
         if not hardware.is_termux_available():
             logger.info("termux-battery-status が見つかりません。温度監視を無効化します。")
             return
@@ -166,18 +143,15 @@ class SensorMonitor:
                     )
                     notifier.notify_overheat(cfg.webhook_url, temp or 0.0, cfg.cooldown_sleep_sec)
 
-                    # 休止フラグON → センサーループ側がPopenを終了させる
                     self._cooldown_event.set()
                     self._terminate_proc()
 
-                    # 休止中も停止指示はチェックする
                     waited = 0.0
                     step = 1.0
                     while waited < cfg.cooldown_sleep_sec and not self._stop_event.is_set():
                         time.sleep(step)
                         waited += step
 
-                    # 復帰
                     self._cooldown_event.clear()
                     notifier.notify_resume(cfg.webhook_url, hardware.get_battery_temperature())
                     logger.info("休止終了。センサー監視を再開します。")
@@ -187,7 +161,6 @@ class SensorMonitor:
             except Exception as e:
                 logger.exception(f"温度監視ループで例外: {e}")
 
-            # チェック間隔
             self._stop_event.wait(cfg.temp_check_interval_sec)
 
     # ------------------------------------------------------------------
@@ -195,10 +168,6 @@ class SensorMonitor:
     # ------------------------------------------------------------------
 
     def _sensor_loop(self) -> None:
-        """
-        termux-sensor をPopenで起動し、出力を1行ずつ読み取って状態を更新する。
-        休止中はPopenを起動しない。停止指示で抜ける。
-        """
         logger.info("センサーループ開始")
         while not self._stop_event.is_set():
             if self._cooldown_event.is_set():
@@ -224,12 +193,10 @@ class SensorMonitor:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
-                bufsize=1,  # 行バッファリング
+                bufsize=1,
             )
         except FileNotFoundError:
-            logger.error(
-                "termux-sensor コマンドが見つかりません。Termux:API をインストールしてください。"
-            )
+            logger.error("termux-sensor コマンドが見つかりません。Termux:API をインストールしてください。")
             time.sleep(30.0)
             return
         except Exception as e:
@@ -237,7 +204,6 @@ class SensorMonitor:
             time.sleep(5.0)
             return
 
-        # JSONブロックを蓄積するバッファ（termux-sensor は複数行JSONを吐く）
         buf: list[str] = []
         depth = 0
         line_count = 0
@@ -251,11 +217,9 @@ class SensorMonitor:
 
                 line_count += 1
 
-                # 最初の数行と定期的にデバッグログを出して疎通確認
                 if line_count <= 10 or line_count % 100 == 0:
                     logger.info(f"[センサー生出力 L{line_count}] {line.rstrip()}")
 
-                # JSONブロックを蓄積して複数行形式に対応
                 buf.append(line)
                 depth += line.count("{") - line.count("}")
                 if depth <= 0 and buf:
@@ -268,7 +232,6 @@ class SensorMonitor:
         except Exception as e:
             logger.exception(f"センサー出力読み取り中に例外: {e}")
         finally:
-            # stderrを回収してログに出す
             try:
                 if self._proc and self._proc.stderr:
                     err = self._proc.stderr.read()
@@ -279,7 +242,7 @@ class SensorMonitor:
             self._terminate_proc()
 
     def _handle_json_block(self, block: str) -> None:
-        """JSONブロックが切り出せたら accelerometer のmagnitudeを抽出して扱う。"""
+        """JSONブロックからgravityセンサーのZ値を抽出してハンドラに渡す。"""
         try:
             data = json.loads(block)
         except json.JSONDecodeError as e:
@@ -290,7 +253,6 @@ class SensorMonitor:
             logger.debug(f"JSON最上位がdictでない: {type(data)}")
             return
 
-        # キー名は大文字小文字を無視して "gravity" を含むものを拾う
         sensor = None
         for key in data:
             if "gravity" in key.lower():
@@ -304,61 +266,40 @@ class SensorMonitor:
         values = sensor.get("values")
         if isinstance(values, list) and len(values) >= 3:
             try:
-                x = float(values[0])
-                y = float(values[1])
                 z = float(values[2])
             except (TypeError, ValueError) as e:
-                logger.warning(f"加速度値変換失敗: {e}")
+                logger.warning(f"Z値変換失敗: {e}")
                 return
-
-            magnitude = math.sqrt(x * x + y * y + z * z)
-            # 前回との差分（振動の強さ）をハンドラに渡す
-            self._handle_magnitude(magnitude)
+            self._handle_z_value(z)
         else:
             logger.warning(f"valuesが不正: {values!r}")
 
     # ------------------------------------------------------------------
-    # 状態機械（振動の標準偏差ベース + Debounce）
+    # 状態機械（Z軸ベース + Debounce）
     # ------------------------------------------------------------------
 
-    def _handle_magnitude(self, magnitude: float) -> None:
-        """1サンプル分のmagnitudeを受けて、バッファ更新→平均magnitude判定→Debounceを回す。
+    def _handle_z_value(self, z: float) -> None:
+        """1サンプル分のZ値を受けて、着席/離席判定 → Debounceを回す。
 
-        Linear Acceleration Sensor は重力除去済みなので静止時 ≈ 0。
-        平均magnitudeが閾値以上なら「動き=着席中」、未満なら「静止=離席中」と判定する。
+        Z ≥ z_threshold → 着席（スマホが水平＝体重がかかっている）
+        Z < z_threshold → 離席（スマホが傾いている）
         """
         cfg = self.config
         now = time.monotonic()
 
         with self._state_lock:
-            # 連続サンプル間の差分をバッファに積む（初回は差分なし）
-            if self._prev_magnitude is not None:
-                delta = abs(magnitude - self._prev_magnitude)
-                self._magnitude_buffer.append(delta)
-            self._prev_magnitude = magnitude
+            self._latest_z = z
 
-            if len(self._magnitude_buffer) < 2:
-                return
+            observed = STATUS_SEATED if z >= cfg.z_threshold else STATUS_LEFT
 
-            avg_delta = sum(self._magnitude_buffer) / len(self._magnitude_buffer)
-            self._latest_stddev = avg_delta  # 互換フィールドに格納
-
-            # 平均delta（変化量）が閾値以上 → 振動あり = 着席中
-            # 平均delta（変化量）が閾値未満 → 静止 = 離席中
-            observed = (
-                STATUS_SEATED if avg_delta >= cfg.vibration_threshold else STATUS_LEFT
-            )
-
-            # 5秒ごとに現状をINFOログへ
             if now - self._last_status_log_at >= STATUS_LOG_INTERVAL_SEC:
                 self._last_status_log_at = now
                 logger.info(
-                    f"[判定] avg_delta={avg_delta:.4f} 閾値={cfg.vibration_threshold} "
-                    f"observed={observed} confirmed={self._confirmed_state} "
-                    f"samples={len(self._magnitude_buffer)}"
+                    f"[判定] Z={z:.3f} 閾値={cfg.z_threshold} "
+                    f"observed={observed} confirmed={self._confirmed_state}"
                 )
 
-            # 確定状態がまだ無い場合は Debounce を一応かけて初回確定（誤判定防止）
+            # 確定状態がまだ無い場合はDebounceをかけて初回確定
             if self._confirmed_state is None:
                 if self._candidate_state is None:
                     self._candidate_state = observed
@@ -369,32 +310,30 @@ class SensorMonitor:
                     self._candidate_since = now
                     return
                 if (now - (self._candidate_since or now)) >= cfg.debounce_delay_sec:
-                    self._commit_state(observed, avg_mag)
+                    self._commit_state(observed, z)
                 return
 
-            # 確定状態と同じならリセット
+            # 確定状態と同じならキャンセル
             if observed == self._confirmed_state:
                 if self._candidate_state is not None:
-                    logger.debug(
-                        f"候補状態 {self._candidate_state} をキャンセル（戻った）"
-                    )
+                    logger.debug(f"候補状態 {self._candidate_state} をキャンセル（戻った）")
                 self._candidate_state = None
                 self._candidate_since = None
                 return
 
             # 確定状態と異なる観測 → 候補として記録
             if self._candidate_state != observed:
-                logger.debug(f"候補状態を更新: {observed} (stddev={stddev:.4f})")
+                logger.debug(f"候補状態を更新: {observed} (Z={z:.3f})")
                 self._candidate_state = observed
                 self._candidate_since = now
                 return
 
-            # 候補が継続中。閾値時間を満たしたら確定へ昇格
+            # 候補が継続中。Debounce時間を満たしたら確定へ昇格
             elapsed = now - (self._candidate_since or now)
             if elapsed >= cfg.debounce_delay_sec:
-                self._commit_state(observed, avg_mag)
+                self._commit_state(observed, z)
 
-    def _commit_state(self, new_state: str, stddev: float) -> None:
+    def _commit_state(self, new_state: str, z_value: float) -> None:
         """確定処理。state_lock 保有中の前提。"""
         cfg = self.config
         prev = self._confirmed_state
@@ -402,19 +341,17 @@ class SensorMonitor:
         self._candidate_state = None
         self._candidate_since = None
 
-        logger.info(f"状態確定: {prev} -> {new_state} (stddev={stddev:.4f})")
+        logger.info(f"状態確定: {prev} -> {new_state} (Z={z_value:.3f})")
 
-        # DB書き込み（z_value カラムには参考値として標準偏差を保存）
         ok = db_models.insert_status(
             cfg.db_path,
             new_state,
-            z_value=stddev,
+            z_value=z_value,
             note=None,
         )
         if not ok:
             logger.error("DB書き込みに失敗しました（通知は継続）")
 
-        # Webhook通知（送信失敗は無視）
         try:
             if new_state == STATUS_SEATED:
                 notifier.notify_seated(cfg.webhook_url)
