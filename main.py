@@ -18,6 +18,7 @@ import os
 import signal
 import sys
 import threading
+import time
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
@@ -37,6 +38,47 @@ from src.web.app import create_app  # noqa: E402
 # ---------------------------------------------------------------------------
 # ロギングセットアップ
 # ---------------------------------------------------------------------------
+
+def kill_existing_on_port(port: int) -> None:
+    """/proc/net/tcp 経由でポートを使っているプロセスをkillする。"""
+    try:
+        hex_port = format(port, "04X")
+        with open("/proc/net/tcp") as f:
+            lines = f.readlines()[1:]
+
+        target_inodes: set[str] = set()
+        for line in lines:
+            parts = line.strip().split()
+            if len(parts) < 10:
+                continue
+            if parts[1].split(":")[1].upper() == hex_port:
+                target_inodes.add(parts[9])
+
+        if not target_inodes:
+            return
+
+        for pid_str in os.listdir("/proc"):
+            if not pid_str.isdigit():
+                continue
+            pid = int(pid_str)
+            if pid == os.getpid():
+                continue
+            try:
+                for fd in os.listdir(f"/proc/{pid}/fd"):
+                    try:
+                        link = os.readlink(f"/proc/{pid}/fd/{fd}")
+                        if any(f"socket:[{inode}]" in link for inode in target_inodes):
+                            os.kill(pid, signal.SIGKILL)
+                            print(f"[INFO] ポート{port}を使用中のPID {pid} をkillしました")
+                            time.sleep(1)
+                            return
+                    except OSError:
+                        continue
+            except OSError:
+                continue
+    except Exception as e:
+        print(f"[WARN] ポートkill失敗（続行）: {e}")
+
 
 def setup_logging(log_path: str) -> None:
     log_dir = os.path.dirname(log_path)
@@ -178,7 +220,8 @@ def main() -> int:
         # メインスレッド以外では登録できない場合がある（無視）
         pass
 
-    # Flask 起動
+    # ポート競合を自動解消してからFlask起動
+    kill_existing_on_port(web_cfg["port"])
     app = create_app(sensor_cfg.db_path, monitor=monitor)
     try:
         logger.info(f"Flask 起動: http://{web_cfg['host']}:{web_cfg['port']}/")
