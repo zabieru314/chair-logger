@@ -59,9 +59,7 @@ class SensorMonitor:
         confirmed_state に昇格させ、DBへ書き込み + Webhook通知。
     """
 
-    # termux-sensor の values 配列から数値を抽出する正規表現
-    # 出力例: "values" : [ 0.12, 9.80, 0.34 ]  ← Z値は3番目
-    _VALUES_LINE_RE = re.compile(r'"values"\s*:\s*\[\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)')
+    # termux-sensor の出力は values が複数行に分かれるため、JSONブロック単位でパースする
 
     def __init__(self, config: SensorConfig):
         self.config = config
@@ -238,17 +236,7 @@ class SensorMonitor:
                 if line_count <= 10 or line_count % 50 == 0:
                     logger.info(f"[センサー生出力 L{line_count}] {line.rstrip()}")
 
-                # values配列の1行完結パターン: "values" : [ x, y, z ]
-                m = self._VALUES_LINE_RE.search(line)
-                if m:
-                    try:
-                        z = float(m.group(3))
-                        logger.debug(f"values正規表現でZ値取得: {z:.3f}")
-                        self._handle_z(z)
-                    except ValueError:
-                        pass
-
-                # JSONブロックを蓄積して複数行形式にも対応
+                # JSONブロックを蓄積して複数行形式に対応
                 buf.append(line)
                 depth += line.count("{") - line.count("}")
                 if depth <= 0 and buf:
@@ -284,20 +272,20 @@ class SensorMonitor:
                 break
 
         if not isinstance(sensor, dict):
-            logger.debug(f"gravityキーが見つからない。キー一覧: {list(data.keys())}")
+            logger.warning(f"gravityキーが見つからない。キー一覧: {list(data.keys())}")
             return
 
         values = sensor.get("values")
         if isinstance(values, list) and len(values) >= 3:
             try:
                 z = float(values[2])
-                logger.debug(f"JSONブロックでZ値取得: {z:.3f}")
+                logger.info(f"Z値取得: {z:.3f} (閾値={self.config.z_threshold})")
                 self._handle_z(z)
             except (TypeError, ValueError) as e:
-                logger.debug(f"Z値変換失敗: {e}")
+                logger.warning(f"Z値変換失敗: {e}")
                 return
         else:
-            logger.debug(f"valuesが不正: {values!r}")
+            logger.warning(f"valuesが不正: {values!r}")
 
     # ------------------------------------------------------------------
     # 状態機械（Debounce）
