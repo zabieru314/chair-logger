@@ -186,9 +186,9 @@ class SensorMonitor:
         cfg = self.config
         cmd = ["termux-sensor", "-s", "gravity", "-d", str(cfg.sensor_interval_ms)]
 
-        # 前回の残骸プロセスを必ずkillしてから起動（残っているとセンサーがフリーズする）
+        # 前回の残骸リスナーを -c で解放してから起動（pkill は binder を壊すため使わない）
         try:
-            subprocess.run(["pkill", "-f", "termux-sensor"], timeout=3)
+            subprocess.run(["termux-sensor", "-c"], capture_output=True, timeout=5)
         except Exception:
             pass
 
@@ -371,17 +371,28 @@ class SensorMonitor:
     # ------------------------------------------------------------------
 
     def _terminate_proc(self) -> None:
-        """Popen を安全に終了させる。"""
+        """Popen を安全に終了させる。
+        SIGINT を送ることで termux-sensor が Termux:API リスナーを解放してから終了する。
+        SIGTERM/SIGKILL は binder 接続を壊すため使わない。
+        """
         proc = self._proc
         self._proc = None
         if proc is None:
             return
         try:
             if proc.poll() is None:
-                proc.terminate()
+                proc.send_signal(__import__("signal").SIGINT)
                 try:
-                    proc.wait(timeout=3.0)
+                    proc.wait(timeout=5.0)
                 except subprocess.TimeoutExpired:
+                    # SIGINT でも終了しない場合のみ SIGKILL（既に壊れている状態）
                     proc.kill()
+                    proc.wait(timeout=3.0)
         except Exception as e:
             logger.exception(f"Popen 終了処理で例外: {e}")
+        finally:
+            # SIGINT 後にも念のりリスナー解放を要求
+            try:
+                subprocess.run(["termux-sensor", "-c"], capture_output=True, timeout=5)
+            except Exception:
+                pass

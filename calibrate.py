@@ -3,8 +3,8 @@
 
 【設計方針】
   フェーズごとに subprocess.run + "-n 20" で独立した短期セッションを使う。
-  長いセッション(-n 120 等)は自然終了後も Termux:API binder を壊すため使わない。
-  "-n 1" を含む短期セッションは何度でも安全に呼べることを確認済み。
+  各フェーズ終了後に termux-sensor -c でリスナーを明示的に解放する。
+  停止時は SIGINT を送ることで Termux:API 側がクリーンアップしてから終了する。
 """
 
 from __future__ import annotations
@@ -30,6 +30,17 @@ def _countdown(seconds: int) -> None:
     for i in range(seconds, 0, -1):
         _log(f"  {i}秒...")
         time.sleep(1)
+
+
+def _sensor_cleanup() -> None:
+    """Termux:API のセンサーリスナーを明示的に解放する。"""
+    try:
+        subprocess.run(
+            ["termux-sensor", "-c"],
+            capture_output=True, timeout=5,
+        )
+    except Exception:
+        pass
 
 
 def _parse_z_values(stdout: str) -> list[float]:
@@ -84,11 +95,15 @@ def collect_phase(label: str, pre_delay_sec: int) -> list[float]:
             timeout=N_SAMPLES * INTERVAL_MS / 1000 + 10,
         )
     except subprocess.TimeoutExpired:
-        _log("  [NG] タイムアウト - Termux:API を確認してください。")
+        _log("  [NG] タイムアウト - termux-sensor -c でリセット後に再試行してください。")
+        _sensor_cleanup()
         return []
     except FileNotFoundError:
         _log("[ERROR] termux-sensor が見つかりません。")
         sys.exit(1)
+    finally:
+        # フェーズ完了後に必ずリスナーを解放（次フェーズや次回実行のため）
+        _sensor_cleanup()
 
     if r.stderr.strip():
         _log(f"  [STDERR] {r.stderr.strip()[:200]}")
@@ -126,7 +141,7 @@ def update_env(threshold: float) -> None:
 def main() -> None:
     print("=" * 50)
     print("  着席検知システム 閾値キャリブレーション")
-    print(f"  各フェーズ: -n {N_SAMPLES} ({N_SAMPLES * INTERVAL_MS // 1000}秒)の独立セッション")
+    print(f"  各フェーズ: -n {N_SAMPLES} ({N_SAMPLES * INTERVAL_MS // 1000}秒) + -c クリーンアップ")
     print("=" * 50)
 
     # 競合プロセスが存在する場合は EXIT（kill はしない）
@@ -139,10 +154,12 @@ def main() -> None:
             conflicts.append(f"  {pat}: PID={pids}")
 
     if conflicts:
-        _log("[ERROR] 以下のプロセスが動いています。先に Ctrl+C で停止してください：")
+        _log("[ERROR] 以下のプロセスが動いています。")
         for c in conflicts:
             _log(c)
-        _log("\n⚠️  pkill -9 や kill -9 は使わないこと（Termux:API が壊れる）。")
+        _log("\n停止方法:")
+        _log("  main.py    → Ctrl+C で止める")
+        _log("  termux-sensor → termux-sensor -c でリスナー解放 → 自然に消える")
         sys.exit(1)
 
     _log("  競合プロセスなし → 続行\n")
@@ -153,7 +170,7 @@ def main() -> None:
         pre_delay_sec=3,
     )
 
-    # フェーズ2: 離席（前フェーズの短期セッションが終了してから新しいセッション開始）
+    # フェーズ2: 離席（前フェーズの -c 解放後に新しいセッション開始）
     left_z = collect_phase(
         "離席中: Enter後5秒で収集開始。その間にその場を離れてください",
         pre_delay_sec=5,
