@@ -199,8 +199,8 @@ class SensorMonitor:
         termux-sensor をPopenで起動し、出力を1行ずつ読み取って状態を更新する。
         休止中はPopenを起動しない。停止指示で抜ける。
         """
+        logger.info("センサーループ開始")
         while not self._stop_event.is_set():
-            # 休止中はPopenを起動しない
             if self._cooldown_event.is_set():
                 time.sleep(1.0)
                 continue
@@ -210,6 +210,7 @@ class SensorMonitor:
             except Exception as e:
                 logger.exception(f"センサーループで例外、5秒後にリトライ: {e}")
                 time.sleep(5.0)
+        logger.info("センサーループ終了")
 
     def _run_sensor_once(self) -> None:
         """termux-sensor を1回起動して、終了するまで読み続ける。"""
@@ -267,6 +268,14 @@ class SensorMonitor:
         except Exception as e:
             logger.exception(f"センサー出力読み取り中に例外: {e}")
         finally:
+            # stderrを回収してログに出す
+            try:
+                if self._proc and self._proc.stderr:
+                    err = self._proc.stderr.read()
+                    if err and err.strip():
+                        logger.warning(f"[termux-sensor stderr] {err.strip()}")
+            except Exception:
+                pass
             self._terminate_proc()
 
     def _handle_json_block(self, block: str) -> None:
