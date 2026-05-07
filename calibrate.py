@@ -138,14 +138,15 @@ def main() -> None:
     print("=" * 50)
     print("スマホをクッションの下（実際の使用位置）に置いた状態で実行してください。")
 
-    # 起動中の main.py とセンサープロセスを停止してから計測する
-    print("\n[準備] main.py / termux-sensor を停止しています...", flush=True)
+    # 起動中の main.py とセンサープロセスを強制終了してから計測する
+    # SIGTERM だと graceful shutdown 中にセンサーが再起動されて競合するため -9 を使う
+    print("\n[準備] main.py / termux-sensor を強制停止しています...", flush=True)
     for target in ["main.py", "termux-sensor"]:
         try:
-            subprocess.run(["pkill", "-f", target], timeout=3)
+            subprocess.run(["pkill", "-9", "-f", target], timeout=3)
         except Exception:
             pass
-    time.sleep(2)
+    time.sleep(3)
     print("[準備完了] キャリブレーションを開始します。\n", flush=True)
 
     seated_z = read_sensor_samples(
