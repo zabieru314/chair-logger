@@ -222,7 +222,8 @@ class SensorMonitor:
                 cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                bufsize=0,  # バイナリモード（子プロセスのバッファリングをバイパス）
+                text=True,
+                bufsize=1,  # 行バッファリング
             )
         except FileNotFoundError:
             logger.error(
@@ -242,12 +243,11 @@ class SensorMonitor:
 
         try:
             assert self._proc.stdout is not None
-            for raw in self._proc.stdout:
+            for line in self._proc.stdout:
                 if self._stop_event.is_set() or self._cooldown_event.is_set():
                     logger.info("停止/休止指示を検出、Popenを終了します。")
                     break
 
-                line = raw.decode("utf-8", errors="replace")
                 line_count += 1
 
                 # 最初の数行と定期的にデバッグログを出して疎通確認
