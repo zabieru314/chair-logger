@@ -4,19 +4,19 @@
 # 使い方:
 #   bash termux/setup.sh "https://discord.com/api/webhooks/xxxx/yyyy" [DEBOUNCE秒数]
 #
-# 例（テスト用に5秒）:
+# 例（テスト用に3秒）:
+#   bash termux/setup.sh "https://discord.com/api/webhooks/..." 3
+# 例（本番用に5秒）:
 #   bash termux/setup.sh "https://discord.com/api/webhooks/..." 5
-# 例（本番用に60秒）:
-#   bash termux/setup.sh "https://discord.com/api/webhooks/..." 60
 #
-# 第2引数を省略すると DEBOUNCE_DELAY_SEC=60（デフォルト）
+# 第2引数を省略すると DEBOUNCE_DELAY_SEC=5（デフォルト）
 
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 ENV_FILE="${SCRIPT_DIR}/.env"
 WEBHOOK_URL="${1:-}"
-DEBOUNCE_DELAY_SEC="${2:-60}"
+DEBOUNCE_DELAY_SEC="${2:-5}"
 
 echo "=== 着席検知システム セットアップ ==="
 echo "プロジェクトルート: ${SCRIPT_DIR}"
@@ -25,7 +25,7 @@ echo "プロジェクトルート: ${SCRIPT_DIR}"
 cat > "${ENV_FILE}" << EOF
 WEBHOOK_URL=${WEBHOOK_URL}
 
-Z_THRESHOLD=5.0
+VIBRATION_THRESHOLD=0.3
 DEBOUNCE_DELAY_SEC=${DEBOUNCE_DELAY_SEC}
 MAX_TEMP_CELSIUS=40.0
 COOLDOWN_SLEEP_SEC=300
@@ -37,7 +37,7 @@ FLASK_PORT=8080
 DB_PATH=data/chair_log.db
 LOG_PATH=logs/app.log
 
-SENSOR_INTERVAL_MS=1000
+SENSOR_INTERVAL_MS=500
 EOF
 
 echo ".env を生成しました: ${ENV_FILE}"

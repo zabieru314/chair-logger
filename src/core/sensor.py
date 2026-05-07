@@ -3,8 +3,12 @@
 
 【絶対厳守の設計方針】
 - ポーリング厳禁。`subprocess.run` で繰り返し呼ぶのは熱暴走の原因になるためNG。
-- `termux-sensor -s gravity -d 1000` を `subprocess.Popen` で1回だけ起動し、
+- `termux-sensor -s accelerometer -d 500` を `subprocess.Popen` で1回だけ起動し、
   標準出力をストリームとして1行ずつ非同期に読み取る。
+- 加速度センサーのmagnitude（√(x²+y²+z²)）を直近20サンプル（約10秒分）バッファし、
+  その標準偏差を「振動の強さ」として状態判定する。
+    - 標準偏差 ≥ VIBRATION_THRESHOLD → 着席中（vibrating = seated）
+    - 標準偏差 < VIBRATION_THRESHOLD → 離席中（still = left）
 - 状態が変化してから DEBOUNCE_DELAY_SEC 秒の間その状態が継続した場合のみ
   「確定」とみなす（チャタリング対策）。
 - 温度監視スレッドが「休止指示」を出している間は、Popen を一旦終了させ、
@@ -15,12 +19,14 @@ from __future__ import annotations
 
 import json
 import logging
-import re
+import math
+import statistics
 import subprocess
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
-from typing import Callable, Optional
+from typing import Deque, Optional
 
 from src.db import models as db_models
 from src.utils import hardware, notifier
@@ -32,22 +38,29 @@ logger = logging.getLogger(__name__)
 STATUS_SEATED = "seated"
 STATUS_LEFT = "left"
 
+# 振動バッファのサイズ（直近20サンプル ≒ 500ms × 20 = 10秒分）
+VIBRATION_BUFFER_SIZE = 20
+
+# 標準偏差・状態の定期ログ出力間隔（秒）
+STATUS_LOG_INTERVAL_SEC = 5.0
+
 
 @dataclass
 class SensorConfig:
     db_path: str
     webhook_url: Optional[str]
-    z_threshold: float
+    vibration_threshold: float
     debounce_delay_sec: float
     max_temp_celsius: float
     cooldown_sleep_sec: int
     temp_check_interval_sec: float
-    sensor_interval_ms: int
+    sensor_interval_ms: int = 500
 
 
 class SensorMonitor:
     """
-    重力センサーをストリームで読み続け、Debounce後に状態確定するモニター。
+    加速度センサーをストリームで読み続け、振動の強さ（magnitudeの標準偏差）から
+    着席/離席を判定し、Debounce後に状態確定するモニター。
 
     状態機械:
         confirmed_state    : 直近で確定済みの状態（初期値 None）
@@ -68,7 +81,11 @@ class SensorMonitor:
         self._confirmed_state: Optional[str] = None
         self._candidate_state: Optional[str] = None
         self._candidate_since: Optional[float] = None
-        self._latest_z: Optional[float] = None
+
+        # 振動バッファ（magnitudeを直近VIBRATION_BUFFER_SIZE個保持）
+        self._magnitude_buffer: Deque[float] = deque(maxlen=VIBRATION_BUFFER_SIZE)
+        self._latest_stddev: Optional[float] = None
+        self._last_status_log_at: float = 0.0
 
         # 制御フラグ
         self._stop_event = threading.Event()
@@ -119,7 +136,8 @@ class SensorMonitor:
                 "confirmed_state": self._confirmed_state,
                 "candidate_state": self._candidate_state,
                 "candidate_since": self._candidate_since,
-                "latest_z": self._latest_z,
+                "latest_z": self._latest_stddev,  # 互換: テンプレート側で「最新値」として表示
+                "latest_stddev": self._latest_stddev,
                 "is_cooldown": self._cooldown_event.is_set(),
             }
 
@@ -180,7 +198,6 @@ class SensorMonitor:
         termux-sensor をPopenで起動し、出力を1行ずつ読み取って状態を更新する。
         休止中はPopenを起動しない。停止指示で抜ける。
         """
-        cfg = self.config
         while not self._stop_event.is_set():
             # 休止中はPopenを起動しない
             if self._cooldown_event.is_set():
@@ -196,7 +213,7 @@ class SensorMonitor:
     def _run_sensor_once(self) -> None:
         """termux-sensor を1回起動して、終了するまで読み続ける。"""
         cfg = self.config
-        cmd = ["termux-sensor", "-s", "gravity", "-d", str(cfg.sensor_interval_ms)]
+        cmd = ["termux-sensor", "-s", "accelerometer", "-d", str(cfg.sensor_interval_ms)]
 
         logger.info(f"termux-sensor を起動: {' '.join(cmd)}")
         try:
@@ -233,7 +250,7 @@ class SensorMonitor:
                 line_count += 1
 
                 # 最初の数行と定期的にデバッグログを出して疎通確認
-                if line_count <= 10 or line_count % 50 == 0:
+                if line_count <= 10 or line_count % 100 == 0:
                     logger.info(f"[センサー生出力 L{line_count}] {line.rstrip()}")
 
                 # JSONブロックを蓄積して複数行形式に対応
@@ -252,7 +269,7 @@ class SensorMonitor:
             self._terminate_proc()
 
     def _handle_json_block(self, block: str) -> None:
-        """JSONブロックが切り出せたら gravity の z 値を抽出して扱う。"""
+        """JSONブロックが切り出せたら accelerometer のmagnitudeを抽出して扱う。"""
         try:
             data = json.loads(block)
         except json.JSONDecodeError as e:
@@ -263,49 +280,73 @@ class SensorMonitor:
             logger.debug(f"JSON最上位がdictでない: {type(data)}")
             return
 
-        # termux-sensor の出力形式: {"gravity": {"values": [x, y, z]}} など
-        # キー名がスペース入り（"gravity "）の場合も考慮
+        # termux-sensor の出力形式: {"Accelerometer": {"values": [x, y, z]}} など
+        # キー名は大文字小文字を無視して "accelerometer" を含むものを拾う
         sensor = None
         for key in data:
-            if "gravity" in key.lower():
+            if "accelerometer" in key.lower():
                 sensor = data[key]
                 break
 
         if not isinstance(sensor, dict):
-            logger.warning(f"gravityキーが見つからない。キー一覧: {list(data.keys())}")
+            logger.warning(f"accelerometerキーが見つからない。キー一覧: {list(data.keys())}")
             return
 
         values = sensor.get("values")
         if isinstance(values, list) and len(values) >= 3:
             try:
+                x = float(values[0])
+                y = float(values[1])
                 z = float(values[2])
-                logger.info(f"Z値取得: {z:.3f} (閾値={self.config.z_threshold})")
-                self._handle_z(z)
             except (TypeError, ValueError) as e:
-                logger.warning(f"Z値変換失敗: {e}")
+                logger.warning(f"加速度値変換失敗: {e}")
                 return
+
+            magnitude = math.sqrt(x * x + y * y + z * z)
+            self._handle_magnitude(magnitude)
         else:
             logger.warning(f"valuesが不正: {values!r}")
 
     # ------------------------------------------------------------------
-    # 状態機械（Debounce）
+    # 状態機械（振動の標準偏差ベース + Debounce）
     # ------------------------------------------------------------------
 
-    def _handle_z(self, z: float) -> None:
-        """1サンプル分のZ値を受けて、Debounce状態機械を回す。"""
+    def _handle_magnitude(self, magnitude: float) -> None:
+        """1サンプル分のmagnitudeを受けて、バッファ更新→標準偏差判定→Debounceを回す。"""
         cfg = self.config
-
-        # Z軸が閾値以上 → 椅子が立っている = 着席中
-        # Z軸が閾値未満 → 椅子が傾いた / 持ち上げられた = 離席中
-        observed = STATUS_SEATED if z >= cfg.z_threshold else STATUS_LEFT
         now = time.monotonic()
 
         with self._state_lock:
-            self._latest_z = z
+            self._magnitude_buffer.append(magnitude)
 
-            # 確定状態がまだ無い場合は即時確定（初回起動時）
+            # サンプル数が2未満では標準偏差を計算できない
+            if len(self._magnitude_buffer) < 2:
+                return
+
+            try:
+                stddev = statistics.pstdev(self._magnitude_buffer)
+            except statistics.StatisticsError:
+                return
+
+            self._latest_stddev = stddev
+
+            # 標準偏差が閾値以上 → 振動あり = 着席中
+            # 標準偏差が閾値未満 → 振動なし = 離席中
+            observed = (
+                STATUS_SEATED if stddev >= cfg.vibration_threshold else STATUS_LEFT
+            )
+
+            # 5秒ごとに現状をINFOログへ
+            if now - self._last_status_log_at >= STATUS_LOG_INTERVAL_SEC:
+                self._last_status_log_at = now
+                logger.info(
+                    f"[判定] stddev={stddev:.4f} 閾値={cfg.vibration_threshold} "
+                    f"observed={observed} confirmed={self._confirmed_state} "
+                    f"samples={len(self._magnitude_buffer)}"
+                )
+
+            # 確定状態がまだ無い場合は Debounce を一応かけて初回確定（誤判定防止）
             if self._confirmed_state is None:
-                # 初回も Debounce を一応かける（誤判定防止）
                 if self._candidate_state is None:
                     self._candidate_state = observed
                     self._candidate_since = now
@@ -315,20 +356,22 @@ class SensorMonitor:
                     self._candidate_since = now
                     return
                 if (now - (self._candidate_since or now)) >= cfg.debounce_delay_sec:
-                    self._commit_state(observed, z)
+                    self._commit_state(observed, stddev)
                 return
 
             # 確定状態と同じならリセット
             if observed == self._confirmed_state:
                 if self._candidate_state is not None:
-                    logger.debug(f"候補状態 {self._candidate_state} をキャンセル（戻った）")
+                    logger.debug(
+                        f"候補状態 {self._candidate_state} をキャンセル（戻った）"
+                    )
                 self._candidate_state = None
                 self._candidate_since = None
                 return
 
             # 確定状態と異なる観測 → 候補として記録
             if self._candidate_state != observed:
-                logger.debug(f"候補状態を更新: {observed} (z={z:.2f})")
+                logger.debug(f"候補状態を更新: {observed} (stddev={stddev:.4f})")
                 self._candidate_state = observed
                 self._candidate_since = now
                 return
@@ -336,9 +379,9 @@ class SensorMonitor:
             # 候補が継続中。閾値時間を満たしたら確定へ昇格
             elapsed = now - (self._candidate_since or now)
             if elapsed >= cfg.debounce_delay_sec:
-                self._commit_state(observed, z)
+                self._commit_state(observed, stddev)
 
-    def _commit_state(self, new_state: str, z: float) -> None:
+    def _commit_state(self, new_state: str, stddev: float) -> None:
         """確定処理。state_lock 保有中の前提。"""
         cfg = self.config
         prev = self._confirmed_state
@@ -346,13 +389,13 @@ class SensorMonitor:
         self._candidate_state = None
         self._candidate_since = None
 
-        logger.info(f"状態確定: {prev} -> {new_state} (z={z:.2f})")
+        logger.info(f"状態確定: {prev} -> {new_state} (stddev={stddev:.4f})")
 
-        # DB書き込み
+        # DB書き込み（z_value カラムには参考値として標準偏差を保存）
         ok = db_models.insert_status(
             cfg.db_path,
             new_state,
-            z_value=z,
+            z_value=stddev,
             note=None,
         )
         if not ok:
