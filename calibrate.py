@@ -6,11 +6,18 @@
 
 「座ってください」「離れてください」の指示に従って
 実際のZ軸データを収集し、適切な Z_THRESHOLD を自動提案する。
+
+【動作方針】
+- main.py が動いていたら SIGSTOP で一時停止（Termux:API接続を保つ）
+- termux-sensor の子プロセスだけ SIGKILL で終了
+- キャリブレーション完了後に main.py を SIGCONT で再開
 """
 
 from __future__ import annotations
 
 import json
+import os
+import signal
 import statistics
 import subprocess
 import sys
@@ -21,6 +28,29 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 ENV_FILE = PROJECT_ROOT / ".env"
 COLLECT_SEC = 10
 INTERVAL_MS = 500
+
+
+def _get_pids(pattern: str) -> list[int]:
+    """pattern にマッチするプロセスのPIDリストを返す（自分自身は除く）。"""
+    try:
+        result = subprocess.run(
+            ["pgrep", "-f", pattern], capture_output=True, text=True
+        )
+        my_pid = os.getpid()
+        return [int(p) for p in result.stdout.split() if p.strip().isdigit() and int(p) != my_pid]
+    except Exception:
+        return []
+
+
+def _send_signal(pids: list[int], sig: int, label: str) -> None:
+    for pid in pids:
+        try:
+            os.kill(pid, sig)
+            print(f"  {label} → PID={pid}", flush=True)
+        except ProcessLookupError:
+            pass
+        except Exception as e:
+            print(f"  {label} PID={pid} 失敗: {e}", flush=True)
 
 
 def read_sensor_samples(label: str, duration_sec: int, pre_delay_sec: int = 0) -> list[float]:
@@ -37,12 +67,11 @@ def read_sensor_samples(label: str, duration_sec: int, pre_delay_sec: int = 0) -
 
     print(f"{duration_sec}秒間データを収集します...", flush=True)
 
-    # 前回のプロセスを終了してセンサーを解放してから起動
-    try:
-        subprocess.run(["pkill", "-9", "-f", "termux-sensor"], timeout=3)
-    except Exception:
-        pass
-    time.sleep(1.5)
+    # 残留センサープロセスを終了してから起動
+    sensor_pids = _get_pids("termux-sensor")
+    if sensor_pids:
+        _send_signal(sensor_pids, signal.SIGKILL, "termux-sensor を終了")
+        time.sleep(1.5)
 
     cmd = ["termux-sensor", "-s", "gravity", "-d", str(INTERVAL_MS)]
     z_values: list[float] = []
@@ -113,7 +142,6 @@ def read_sensor_samples(label: str, duration_sec: int, pre_delay_sec: int = 0) -
         except subprocess.TimeoutExpired:
             proc.kill()
 
-        # stderrを表示（エラー原因の手がかり）
         try:
             err = proc.stderr.read() if proc.stderr else ""
             if err.strip():
@@ -157,28 +185,34 @@ def main() -> None:
     print("=" * 50)
     print("スマホをクッションの下（実際の使用位置）に置いた状態で実行してください。")
 
-    # 起動中の main.py とセンサープロセスを強制終了してから計測する
-    print("\n[準備] main.py / termux-sensor を強制停止しています...", flush=True)
-    for target in ["main.py", "termux-sensor"]:
-        try:
-            result = subprocess.run(["pkill", "-9", "-f", target], timeout=3)
-            print(f"  pkill -9 {target}: returncode={result.returncode}", flush=True)
-        except Exception as e:
-            print(f"  pkill {target} 失敗: {e}", flush=True)
+    # main.py を SIGSTOP で一時停止（Termux:API接続を保つ）
+    print("\n[準備] main.py を一時停止します（センサー接続は維持）...", flush=True)
+    main_pids = _get_pids("main.py")
+    if main_pids:
+        _send_signal(main_pids, signal.SIGSTOP, "main.py を一時停止")
+        time.sleep(1)
+    else:
+        print("  main.py は動いていません", flush=True)
 
-    print("[準備] 5秒待機中（センサー解放を待つ）...", flush=True)
-    time.sleep(5)
+    # termux-sensor の子プロセスだけ終了
+    sensor_pids = _get_pids("termux-sensor")
+    if sensor_pids:
+        _send_signal(sensor_pids, signal.SIGKILL, "termux-sensor を終了")
+        time.sleep(2)
+    else:
+        print("  termux-sensor は動いていません", flush=True)
 
-    # センサーが応答するか事前確認
-    print("[確認] termux-sensor -s gravity -n 1 で応答テスト...", flush=True)
+    # センサー応答テスト
+    print("\n[確認] センサー応答テスト中...", flush=True)
     try:
         check = subprocess.run(
             ["termux-sensor", "-s", "gravity", "-n", "1"],
             capture_output=True, text=True, timeout=8
         )
-        print(f"  stdout: {check.stdout[:300]!r}", flush=True)
-        print(f"  stderr: {check.stderr[:200]!r}", flush=True)
-        print(f"  returncode: {check.returncode}", flush=True)
+        if check.stdout.strip():
+            print(f"  [OK] センサー応答あり", flush=True)
+        else:
+            print(f"  [NG] 応答なし stdout={check.stdout[:100]!r} stderr={check.stderr[:100]!r}", flush=True)
     except subprocess.TimeoutExpired:
         print("  [NG] タイムアウト（センサーが応答しない）", flush=True)
     except Exception as e:
@@ -186,16 +220,22 @@ def main() -> None:
 
     print("[準備完了] キャリブレーションを開始します。\n", flush=True)
 
-    seated_z = read_sensor_samples(
-        "着席中: スマホをクッション下に置いて座ってください",
-        COLLECT_SEC,
-        pre_delay_sec=3,
-    )
-    left_z = read_sensor_samples(
-        "離席中: Enter後5秒で収集開始します。その間にその場を離れてください",
-        COLLECT_SEC,
-        pre_delay_sec=5,
-    )
+    try:
+        seated_z = read_sensor_samples(
+            "着席中: スマホをクッション下に置いて座ってください",
+            COLLECT_SEC,
+            pre_delay_sec=3,
+        )
+        left_z = read_sensor_samples(
+            "離席中: Enter後5秒で収集開始します。その間にその場を離れてください",
+            COLLECT_SEC,
+            pre_delay_sec=5,
+        )
+    finally:
+        # 終了時に main.py を必ず再開
+        if main_pids:
+            print("\n[後処理] main.py を再開します...", flush=True)
+            _send_signal(main_pids, signal.SIGCONT, "main.py を再開")
 
     if not seated_z or not left_z:
         print("[ERROR] データが取得できませんでした。")
@@ -212,10 +252,9 @@ def main() -> None:
     if seated_mean <= left_mean:
         print("\n[WARNING] 着席中のZ値が離席中以下です。")
         print("  → スマホの置き方を確認して、もう一度試してください。")
-        print(f"  参考: 現在の Z_THRESHOLD=5.0 のまま使用することをお勧めします。")
+        print("  参考: 現在の Z_THRESHOLD=5.0 のまま使用することをお勧めします。")
         return
 
-    # 着席Z平均と離席Z平均の中点を閾値として提案
     suggested = (seated_mean + left_mean) / 2.0
 
     print(f"\n【推奨 Z_THRESHOLD】: {suggested:.3f}")
