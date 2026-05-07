@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>着席ロガー | Chair Logger</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+    <meta http-equiv="refresh" content="30">
+</head>
+<body>
+    <header class="header">
+        <h1>着席ロガー</h1>
+        <p class="subtitle">在宅勤務の着席・離席自動記録</p>
+    </header>
+
+    <main class="container">
+        <section class="status-card status-{{ current_status }}">
+            <div class="status-label">現在のステータス</div>
+            <div class="status-value">
+                {% if current_status == 'seated' %}
+                    着席中
+                {% elif current_status == 'left' %}
+                    離席中
+                {% else %}
+                    未取得
+                {% endif %}
+            </div>
+            {% if monitor_state %}
+                <div class="status-meta">
+                    {% if monitor_state.is_cooldown %}
+                        <span class="badge badge-warning">温度休止中</span>
+                    {% endif %}
+                    {% if monitor_state.latest_z is not none %}
+                        <span class="meta-item">最新Z値: {{ '%.2f' % monitor_state.latest_z }}</span>
+                    {% endif %}
+                    {% if monitor_state.candidate_state %}
+                        <span class="meta-item">遷移候補: {{ monitor_state.candidate_state }}</span>
+                    {% endif %}
+                </div>
+            {% endif %}
+        </section>
+
+        <section class="history">
+            <h2>直近の履歴</h2>
+            {% if logs %}
+                <table class="log-table">
+                    <thead>
+                        <tr>
+                            <th>日時</th>
+                            <th>ステータス</th>
+                            <th>Z値</th>
+                            <th>メモ</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for log in logs %}
+                            <tr>
+                                <td>{{ log.timestamp }}</td>
+                                <td>
+                                    <span class="status-pill status-{{ log.status }}">
+                                        {% if log.status == 'seated' %}着席{% else %}離席{% endif %}
+                                    </span>
+                                </td>
+                                <td>{% if log.z_value is not none %}{{ '%.2f' % log.z_value }}{% else %}-{% endif %}</td>
+                                <td>{{ log.note or '' }}</td>
+                            </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            {% else %}
+                <p class="empty">まだ記録がありません。</p>
+            {% endif %}
+        </section>
+    </main>
+
+    <footer class="footer">
+        <span>更新: {{ generated_at }}</span>
+        <span>30秒ごとに自動リロード</span>
+    </footer>
+</body>
+</html>
