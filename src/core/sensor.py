@@ -59,9 +59,9 @@ class SensorMonitor:
         confirmed_state に昇格させ、DBへ書き込み + Webhook通知。
     """
 
-    # termux-sensor の値ライン抽出用（行頭の空白・記号は許容）
-    # 例: '          "z": 9.78,'
-    _Z_LINE_RE = re.compile(r'"z"\s*:\s*(-?\d+(?:\.\d+)?)')
+    # termux-sensor の values 配列から数値を抽出する正規表現
+    # 出力例: "values" : [ 0.12, 9.80, 0.34 ]  ← Z値は3番目
+    _VALUES_LINE_RE = re.compile(r'"values"\s*:\s*\[\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)')
 
     def __init__(self, config: SensorConfig):
         self.config = config
@@ -206,14 +206,12 @@ class SensorMonitor:
                 cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                text=True,
-                bufsize=1,  # 行バッファリング
+                bufsize=0,  # バイナリモード（子プロセスのバッファリングをバイパス）
             )
         except FileNotFoundError:
             logger.error(
                 "termux-sensor コマンドが見つかりません。Termux:API をインストールしてください。"
             )
-            # 連打防止に長めにスリープ
             time.sleep(30.0)
             return
         except Exception as e:
@@ -224,24 +222,33 @@ class SensorMonitor:
         # JSONブロックを蓄積するバッファ（termux-sensor は複数行JSONを吐く）
         buf: list[str] = []
         depth = 0
+        line_count = 0
 
         try:
             assert self._proc.stdout is not None
-            for line in self._proc.stdout:
+            for raw in self._proc.stdout:
                 if self._stop_event.is_set() or self._cooldown_event.is_set():
                     logger.info("停止/休止指示を検出、Popenを終了します。")
                     break
 
-                # 軽い手段としてZ値を正規表現でも拾う
-                m = self._Z_LINE_RE.search(line)
+                line = raw.decode("utf-8", errors="replace")
+                line_count += 1
+
+                # 最初の数行と定期的にデバッグログを出して疎通確認
+                if line_count <= 10 or line_count % 50 == 0:
+                    logger.info(f"[センサー生出力 L{line_count}] {line.rstrip()}")
+
+                # values配列の1行完結パターン: "values" : [ x, y, z ]
+                m = self._VALUES_LINE_RE.search(line)
                 if m:
                     try:
-                        z = float(m.group(1))
+                        z = float(m.group(3))
+                        logger.debug(f"values正規表現でZ値取得: {z:.3f}")
                         self._handle_z(z)
                     except ValueError:
                         pass
 
-                # ついでにJSONブロックを切り出してログ用に保持（必要なら拡張ポイント）
+                # JSONブロックを蓄積して複数行形式にも対応
                 buf.append(line)
                 depth += line.count("{") - line.count("}")
                 if depth <= 0 and buf:
@@ -260,20 +267,37 @@ class SensorMonitor:
         """JSONブロックが切り出せたら gravity の z 値を抽出して扱う。"""
         try:
             data = json.loads(block)
-        except json.JSONDecodeError:
+        except json.JSONDecodeError as e:
+            logger.debug(f"JSONパース失敗: {e} | block先頭50字: {block[:50]!r}")
+            return
+
+        if not isinstance(data, dict):
+            logger.debug(f"JSON最上位がdictでない: {type(data)}")
             return
 
         # termux-sensor の出力形式: {"gravity": {"values": [x, y, z]}} など
-        sensor = data.get("gravity") if isinstance(data, dict) else None
+        # キー名がスペース入り（"gravity "）の場合も考慮
+        sensor = None
+        for key in data:
+            if "gravity" in key.lower():
+                sensor = data[key]
+                break
+
         if not isinstance(sensor, dict):
+            logger.debug(f"gravityキーが見つからない。キー一覧: {list(data.keys())}")
             return
+
         values = sensor.get("values")
         if isinstance(values, list) and len(values) >= 3:
             try:
                 z = float(values[2])
+                logger.debug(f"JSONブロックでZ値取得: {z:.3f}")
                 self._handle_z(z)
-            except (TypeError, ValueError):
+            except (TypeError, ValueError) as e:
+                logger.debug(f"Z値変換失敗: {e}")
                 return
+        else:
+            logger.debug(f"valuesが不正: {values!r}")
 
     # ------------------------------------------------------------------
     # 状態機械（Debounce）
