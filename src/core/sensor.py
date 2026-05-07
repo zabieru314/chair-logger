@@ -132,7 +132,12 @@ class SensorMonitor:
     def _temp_loop(self) -> None:
         """
         定期的にバッテリー温度をチェックし、上限超過時は休止フラグを立てる。
+        termux-battery-status が使えない環境（Termux:API 未インストール等）では即終了する。
         """
+        if not hardware.is_termux_available():
+            logger.info("termux-battery-status が見つかりません。温度監視を無効化します。")
+            return
+
         cfg = self.config
         while not self._stop_event.is_set():
             try:
