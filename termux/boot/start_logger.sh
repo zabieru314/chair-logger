@@ -16,8 +16,8 @@ set -eu
 # ---------------------------------------------
 # 設定（必要に応じて編集）
 # ---------------------------------------------
-PROJECT_DIR="$HOME/chair-logger"
-PYTHON_BIN="python3"
+PROJECT_DIR="$HOME/chair_logger/chair_logger"
+PYTHON_BIN="python"
 LOG_DIR="$PROJECT_DIR/logs"
 BOOT_LOG="$LOG_DIR/boot.log"
 PID_FILE="$LOG_DIR/main.pid"
