@@ -242,9 +242,26 @@ def main() -> None:
         pids = r.stdout.strip()
         _log(f"  {pat}: PID={pids if pids else 'なし'}")
 
-    # termux-sensor だけ終了（main.py には触らない）
-    _log("\n[準備] termux-sensor を停止...")
+    # Python プロセスを全て強制終了（自分自身を除く）
+    _log("\n[準備] Python / termux-sensor を全て強制終了...")
+    my_pid = os.getpid()
+    r = subprocess.run(["pgrep", "-f", "python"], capture_output=True, text=True)
+    for p in r.stdout.split():
+        pid = int(p)
+        if pid != my_pid:
+            try:
+                os.kill(pid, signal.SIGKILL)
+                _log(f"  SIGKILL → python PID={pid}")
+            except ProcessLookupError:
+                pass
     _kill_all_sensor_procs()
+
+    _log("\n" + "!"*50)
+    _log("！！！ここで Android ホーム画面から「Termux:API」アプリを開いてください！！！")
+    _log("  → アプリを開いて1〜2秒待つと Termux:API のセンサー接続がリセットされます")
+    _log("!"*50)
+    input("\nTermux:API を開いたら Enter を押してください...")
+    time.sleep(3)
 
     # 事前センサー確認
     _preflight_check()
