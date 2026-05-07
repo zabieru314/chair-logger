@@ -37,6 +37,11 @@ def read_sensor_samples(label: str, duration_sec: int) -> list[float]:
     start = time.monotonic()
 
     try:
+        subprocess.run(["pkill", "-f", "termux-sensor"], timeout=3)
+    except Exception:
+        pass
+
+    try:
         proc = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,

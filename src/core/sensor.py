@@ -186,6 +186,12 @@ class SensorMonitor:
         cfg = self.config
         cmd = ["termux-sensor", "-s", "gravity", "-d", str(cfg.sensor_interval_ms)]
 
+        # 前回の残骸プロセスを必ずkillしてから起動（残っているとセンサーがフリーズする）
+        try:
+            subprocess.run(["pkill", "-f", "termux-sensor"], timeout=3)
+        except Exception:
+            pass
+
         logger.info(f"termux-sensor を起動: {' '.join(cmd)}")
         try:
             self._proc = subprocess.Popen(
