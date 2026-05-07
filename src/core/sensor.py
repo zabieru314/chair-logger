@@ -213,7 +213,7 @@ class SensorMonitor:
     def _run_sensor_once(self) -> None:
         """termux-sensor を1回起動して、終了するまで読み続ける。"""
         cfg = self.config
-        cmd = ["termux-sensor", "-s", "accelerometer", "-d", str(cfg.sensor_interval_ms)]
+        cmd = ["termux-sensor", "-s", "Linear Acceleration Sensor", "-d", str(cfg.sensor_interval_ms)]
 
         logger.info(f"termux-sensor を起動: {' '.join(cmd)}")
         try:
@@ -280,16 +280,16 @@ class SensorMonitor:
             logger.debug(f"JSON最上位がdictでない: {type(data)}")
             return
 
-        # termux-sensor の出力形式: {"Accelerometer": {"values": [x, y, z]}} など
-        # キー名は大文字小文字を無視して "accelerometer" を含むものを拾う
+        # キー名は大文字小文字を無視して "linear acceleration" または "accelerometer" を含むものを拾う
         sensor = None
         for key in data:
-            if "accelerometer" in key.lower():
+            kl = key.lower()
+            if "linear acceleration" in kl or "accelerometer" in kl:
                 sensor = data[key]
                 break
 
         if not isinstance(sensor, dict):
-            logger.warning(f"accelerometerキーが見つからない。キー一覧: {list(data.keys())}")
+            logger.warning(f"加速度センサーキーが見つからない。キー一覧: {list(data.keys())}")
             return
 
         values = sensor.get("values")
@@ -312,35 +312,34 @@ class SensorMonitor:
     # ------------------------------------------------------------------
 
     def _handle_magnitude(self, magnitude: float) -> None:
-        """1サンプル分のmagnitudeを受けて、バッファ更新→標準偏差判定→Debounceを回す。"""
+        """1サンプル分のmagnitudeを受けて、バッファ更新→平均magnitude判定→Debounceを回す。
+
+        Linear Acceleration Sensor は重力除去済みなので静止時 ≈ 0。
+        平均magnitudeが閾値以上なら「動き=着席中」、未満なら「静止=離席中」と判定する。
+        """
         cfg = self.config
         now = time.monotonic()
 
         with self._state_lock:
             self._magnitude_buffer.append(magnitude)
 
-            # サンプル数が2未満では標準偏差を計算できない
             if len(self._magnitude_buffer) < 2:
                 return
 
-            try:
-                stddev = statistics.pstdev(self._magnitude_buffer)
-            except statistics.StatisticsError:
-                return
+            avg_mag = sum(self._magnitude_buffer) / len(self._magnitude_buffer)
+            self._latest_stddev = avg_mag  # 互換のため同フィールドに格納
 
-            self._latest_stddev = stddev
-
-            # 標準偏差が閾値以上 → 振動あり = 着席中
-            # 標準偏差が閾値未満 → 振動なし = 離席中
+            # 平均magnitudeが閾値以上 → 動きあり = 着席中
+            # 平均magnitudeが閾値未満 → 静止 = 離席中
             observed = (
-                STATUS_SEATED if stddev >= cfg.vibration_threshold else STATUS_LEFT
+                STATUS_SEATED if avg_mag >= cfg.vibration_threshold else STATUS_LEFT
             )
 
             # 5秒ごとに現状をINFOログへ
             if now - self._last_status_log_at >= STATUS_LOG_INTERVAL_SEC:
                 self._last_status_log_at = now
                 logger.info(
-                    f"[判定] stddev={stddev:.4f} 閾値={cfg.vibration_threshold} "
+                    f"[判定] avg_mag={avg_mag:.4f} 閾値={cfg.vibration_threshold} "
                     f"observed={observed} confirmed={self._confirmed_state} "
                     f"samples={len(self._magnitude_buffer)}"
                 )
@@ -356,7 +355,7 @@ class SensorMonitor:
                     self._candidate_since = now
                     return
                 if (now - (self._candidate_since or now)) >= cfg.debounce_delay_sec:
-                    self._commit_state(observed, stddev)
+                    self._commit_state(observed, avg_mag)
                 return
 
             # 確定状態と同じならリセット
@@ -379,7 +378,7 @@ class SensorMonitor:
             # 候補が継続中。閾値時間を満たしたら確定へ昇格
             elapsed = now - (self._candidate_since or now)
             if elapsed >= cfg.debounce_delay_sec:
-                self._commit_state(observed, stddev)
+                self._commit_state(observed, avg_mag)
 
     def _commit_state(self, new_state: str, stddev: float) -> None:
         """確定処理。state_lock 保有中の前提。"""
