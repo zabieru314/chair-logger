@@ -57,6 +57,30 @@ termux-sensor -s "Gravity" -n 1   # 動作確認
 
 ---
 
+## 【検知方式】差分メトリクス（2026-05-08 変更）
+
+Z軸の絶対値閾値はスマホの置き方で逆転する問題があったため、
+**連続サンプル間の変化量**（差分メトリクス）方式に変更した。
+
+### アルゴリズム
+
+```
+metric = mean(|ΔX[i] - ΔX[i-1]| + |ΔY[i] - ΔY[i-1]|) over 60 samples (30秒ウィンドウ)
+metric >= VARIANCE_THRESHOLD → 着席（体の微動を検出）
+metric <  VARIANCE_THRESHOLD → 離席（センサーが静止）
+```
+
+### 実測値（参考）
+- 着席時 metric ≈ 0.10〜0.20（呼吸・体重移動でX/Yが揺れる）
+- 離席時 metric ≈ 0.01〜0.015（クッションのゆっくりした変形ドリフト）
+- デフォルト閾値: `VARIANCE_THRESHOLD=0.03`
+
+### この方式のメリット
+- スマホの置く角度・向きに依存しない
+- クッション下・椅子横など置き場所を選ばない
+
+---
+
 ## calibrate.py の使い方
 
 ```bash
@@ -65,10 +89,13 @@ cd ~/chair_logger/chair_logger
 python calibrate.py
 ```
 
-1. 着席状態で Enter → 3秒カウントダウン → 10秒収集
-2. Enter を押してからその場を離れる → 5秒後に10秒収集
-3. 結果が出たら y で .env を自動更新
+1. 着席状態で Enter → 3秒カウントダウン → 10秒収集 → 着席メトリクスが表示される
+2. Enter を押してからその場を離れる → 5秒後に10秒収集 → 離席メトリクスが表示される
+3. **着席メトリクス > 離席メトリクス** なら y で `.env` を自動更新
 4. そのまま `python main.py` を起動できる（再起動不要）
+
+※ デフォルト `VARIANCE_THRESHOLD=0.03` のまま `python main.py` を試してから
+  必要なら calibrate.py でチューニングする方針でもよい。
 
 ---
 
@@ -78,11 +105,6 @@ python calibrate.py
 - 正式名: `"Gravity Sensor"`（termux-sensor -l で確認）
 - コマンド引数では `"gravity"` または `"Gravity Sensor"` で動作確認済み
 - JSON キー: `"Gravity Sensor"` → コード側は `"gravity" in key.lower()` でマッチ
-
-### Z軸の値
-- 水平置き（着席状態）: Z ≈ 9.635〜9.803（実測）
-- 傾き（離席状態）: Z ≈ 2〜4（推定）
-- Z_THRESHOLD デフォルト: 5.0（calibrate.py で実測値に更新可能）
 
 ### Android 15 + OPPO 制限
 - バックグラウンドでのセンサーアクセスはブロックされる
@@ -94,16 +116,17 @@ python calibrate.py
 
 ```
 main.py              エントリーポイント
-calibrate.py         閾値キャリブレーション（1セッション設計）
-src/core/sensor.py   センサー監視コア（Z軸判定）
+calibrate.py         閾値キャリブレーション（差分メトリクス版）
+src/core/sensor.py   センサー監視コア（差分メトリクス判定）
 src/db/models.py     SQLite操作
 src/utils/notifier.py Discord Webhook通知
 src/utils/hardware.py 温度監視
 src/web/app.py       Flask WebUI
-.env                 設定値（Z_THRESHOLD, WEBHOOK_URL等）
+.env                 設定値（VARIANCE_THRESHOLD, WEBHOOK_URL等）
 ```
 
 ## GitHub リポジトリ
 - URL: https://github.com/zabieru314/chair-logger.git
 - ブランチ: main
 - スマホ側: ~/chair_logger/chair_logger/
+- 最新コミット: `b0b65f0`（差分メトリクス方式への切り替え）
