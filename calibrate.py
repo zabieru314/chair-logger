@@ -31,7 +31,7 @@ def read_sensor_samples(label: str, duration_sec: int) -> list[float]:
     input("準備ができたら Enter を押してください...")
     print(f"{duration_sec}秒間データを収集します...", flush=True)
 
-    cmd = ["termux-sensor", "-s", "Gravity Sensor", "-d", str(INTERVAL_MS)]
+    cmd = ["termux-sensor", "-s", "gravity", "-d", str(INTERVAL_MS)]
     magnitudes: list[float] = []
     buf: list[str] = []
     depth = 0

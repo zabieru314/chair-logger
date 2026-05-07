@@ -214,7 +214,7 @@ class SensorMonitor:
     def _run_sensor_once(self) -> None:
         """termux-sensor を1回起動して、終了するまで読み続ける。"""
         cfg = self.config
-        cmd = ["termux-sensor", "-s", "Gravity Sensor", "-d", str(cfg.sensor_interval_ms)]
+        cmd = ["termux-sensor", "-s", "gravity", "-d", str(cfg.sensor_interval_ms)]
 
         logger.info(f"termux-sensor を起動: {' '.join(cmd)}")
         try:
