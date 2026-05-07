@@ -39,45 +39,33 @@ from src.web.app import create_app  # noqa: E402
 # ロギングセットアップ
 # ---------------------------------------------------------------------------
 
-def kill_existing_on_port(port: int) -> None:
-    """/proc/net/tcp 経由でポートを使っているプロセスをkillする。"""
+def kill_by_pidfile(pid_file: str) -> None:
+    """PIDファイルに記録された前回のプロセスをkillする。"""
     try:
-        hex_port = format(port, "04X")
-        with open("/proc/net/tcp") as f:
-            lines = f.readlines()[1:]
-
-        target_inodes: set[str] = set()
-        for line in lines:
-            parts = line.strip().split()
-            if len(parts) < 10:
-                continue
-            if parts[1].split(":")[1].upper() == hex_port:
-                target_inodes.add(parts[9])
-
-        if not target_inodes:
+        if not os.path.exists(pid_file):
             return
-
-        for pid_str in os.listdir("/proc"):
-            if not pid_str.isdigit():
-                continue
-            pid = int(pid_str)
-            if pid == os.getpid():
-                continue
-            try:
-                for fd in os.listdir(f"/proc/{pid}/fd"):
-                    try:
-                        link = os.readlink(f"/proc/{pid}/fd/{fd}")
-                        if any(f"socket:[{inode}]" in link for inode in target_inodes):
-                            os.kill(pid, signal.SIGKILL)
-                            print(f"[INFO] ポート{port}を使用中のPID {pid} をkillしました")
-                            time.sleep(1)
-                            return
-                    except OSError:
-                        continue
-            except OSError:
-                continue
+        with open(pid_file) as f:
+            pid = int(f.read().strip())
+        if pid == os.getpid():
+            return
+        try:
+            os.kill(pid, signal.SIGKILL)
+            print(f"[INFO] 前回のプロセス PID={pid} をkillしました")
+            time.sleep(1)
+        except ProcessLookupError:
+            pass  # 既に終了済み
     except Exception as e:
-        print(f"[WARN] ポートkill失敗（続行）: {e}")
+        print(f"[WARN] PIDファイルkill失敗（続行）: {e}")
+
+
+def write_pidfile(pid_file: str) -> None:
+    """現在のPIDをファイルに書き込む。"""
+    try:
+        os.makedirs(os.path.dirname(pid_file), exist_ok=True)
+        with open(pid_file, "w") as f:
+            f.write(str(os.getpid()))
+    except Exception as e:
+        print(f"[WARN] PIDファイル書き込み失敗: {e}")
 
 
 def setup_logging(log_path: str) -> None:
@@ -220,8 +208,10 @@ def main() -> int:
         # メインスレッド以外では登録できない場合がある（無視）
         pass
 
-    # ポート競合を自動解消してからFlask起動
-    kill_existing_on_port(web_cfg["port"])
+    # 前回のプロセスをkillしてからFlask起動
+    pid_file = str(PROJECT_ROOT / "logs" / "main.pid")
+    kill_by_pidfile(pid_file)
+    write_pidfile(pid_file)
     app = create_app(sensor_cfg.db_path, monitor=monitor)
     try:
         logger.info(f"Flask 起動: http://{web_cfg['host']}:{web_cfg['port']}/")
