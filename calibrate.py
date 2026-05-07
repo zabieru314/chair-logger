@@ -39,10 +39,10 @@ def read_sensor_samples(label: str, duration_sec: int, pre_delay_sec: int = 0) -
 
     # 前回のプロセスを終了してセンサーを解放してから起動
     try:
-        subprocess.run(["pkill", "-f", "termux-sensor"], timeout=3)
+        subprocess.run(["pkill", "-9", "-f", "termux-sensor"], timeout=3)
     except Exception:
         pass
-    time.sleep(1.5)  # センサーが解放されるまで待つ
+    time.sleep(1.5)
 
     cmd = ["termux-sensor", "-s", "gravity", "-d", str(INTERVAL_MS)]
     z_values: list[float] = []
@@ -50,6 +50,7 @@ def read_sensor_samples(label: str, duration_sec: int, pre_delay_sec: int = 0) -
     depth = 0
     start = time.monotonic()
 
+    print(f"  [DBG] Popen起動: {' '.join(cmd)}", flush=True)
     try:
         proc = subprocess.Popen(
             cmd,
@@ -58,9 +59,14 @@ def read_sensor_samples(label: str, duration_sec: int, pre_delay_sec: int = 0) -
             text=True,
             bufsize=1,
         )
+        print(f"  [DBG] PID={proc.pid}", flush=True)
         assert proc.stdout is not None
 
+        line_count = 0
         for line in proc.stdout:
+            line_count += 1
+            if line_count <= 5:
+                print(f"  [生出力 L{line_count}] {line.rstrip()}", flush=True)
             if time.monotonic() - start >= duration_sec:
                 break
 
@@ -96,11 +102,24 @@ def read_sensor_samples(label: str, duration_sec: int, pre_delay_sec: int = 0) -
                     except (TypeError, ValueError):
                         continue
 
+        if not z_values:
+            print("  [NG] サンプルが1件も取得できませんでした", flush=True)
+        else:
+            print(f"  [OK] {len(z_values)}件取得完了", flush=True)
+
         proc.terminate()
         try:
             proc.wait(timeout=3)
         except subprocess.TimeoutExpired:
             proc.kill()
+
+        # stderrを表示（エラー原因の手がかり）
+        try:
+            err = proc.stderr.read() if proc.stderr else ""
+            if err.strip():
+                print(f"  [stderr] {err.strip()}", flush=True)
+        except Exception:
+            pass
 
     except FileNotFoundError:
         print("[ERROR] termux-sensor が見つかりません。Termux:API をインストールしてください。")
@@ -139,14 +158,32 @@ def main() -> None:
     print("スマホをクッションの下（実際の使用位置）に置いた状態で実行してください。")
 
     # 起動中の main.py とセンサープロセスを強制終了してから計測する
-    # SIGTERM だと graceful shutdown 中にセンサーが再起動されて競合するため -9 を使う
     print("\n[準備] main.py / termux-sensor を強制停止しています...", flush=True)
     for target in ["main.py", "termux-sensor"]:
         try:
-            subprocess.run(["pkill", "-9", "-f", target], timeout=3)
-        except Exception:
-            pass
-    time.sleep(3)
+            result = subprocess.run(["pkill", "-9", "-f", target], timeout=3)
+            print(f"  pkill -9 {target}: returncode={result.returncode}", flush=True)
+        except Exception as e:
+            print(f"  pkill {target} 失敗: {e}", flush=True)
+
+    print("[準備] 5秒待機中（センサー解放を待つ）...", flush=True)
+    time.sleep(5)
+
+    # センサーが応答するか事前確認
+    print("[確認] termux-sensor -s gravity -n 1 で応答テスト...", flush=True)
+    try:
+        check = subprocess.run(
+            ["termux-sensor", "-s", "gravity", "-n", "1"],
+            capture_output=True, text=True, timeout=8
+        )
+        print(f"  stdout: {check.stdout[:300]!r}", flush=True)
+        print(f"  stderr: {check.stderr[:200]!r}", flush=True)
+        print(f"  returncode: {check.returncode}", flush=True)
+    except subprocess.TimeoutExpired:
+        print("  [NG] タイムアウト（センサーが応答しない）", flush=True)
+    except Exception as e:
+        print(f"  [ERROR] {e}", flush=True)
+
     print("[準備完了] キャリブレーションを開始します。\n", flush=True)
 
     seated_z = read_sensor_samples(
