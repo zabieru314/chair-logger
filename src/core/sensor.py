@@ -21,6 +21,7 @@ import logging
 import subprocess
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from typing import Optional
 
@@ -37,12 +38,15 @@ STATUS_LEFT = "left"
 # 状態の定期ログ出力間隔（秒）
 STATUS_LOG_INTERVAL_SEC = 5.0
 
+# 差分メトリクスの計算に使うローリングバッファサイズ（30秒 @500ms）
+DIFF_WINDOW_SAMPLES = 60
+
 
 @dataclass
 class SensorConfig:
     db_path: str
     webhook_url: Optional[str]
-    z_threshold: float
+    variance_threshold: float
     debounce_delay_sec: float
     max_temp_celsius: float
     cooldown_sleep_sec: int
@@ -73,6 +77,8 @@ class SensorMonitor:
         self._candidate_since: Optional[float] = None
 
         self._latest_z: Optional[float] = None
+        self._latest_metric: Optional[float] = None
+        self._sample_buf: deque[tuple[float, float]] = deque(maxlen=DIFF_WINDOW_SAMPLES)
         self._last_status_log_at: float = 0.0
 
         self._stop_event = threading.Event()
@@ -119,7 +125,8 @@ class SensorMonitor:
                 "candidate_state": self._candidate_state,
                 "candidate_since": self._candidate_since,
                 "latest_z": self._latest_z,
-                "latest_stddev": self._latest_z,  # テンプレート互換フィールド
+                "latest_metric": self._latest_metric,
+                "latest_stddev": self._latest_metric,  # テンプレート互換フィールド
                 "is_cooldown": self._cooldown_event.is_set(),
             }
 
@@ -272,36 +279,57 @@ class SensorMonitor:
         values = sensor.get("values")
         if isinstance(values, list) and len(values) >= 3:
             try:
+                x = float(values[0])
+                y = float(values[1])
                 z = float(values[2])
             except (TypeError, ValueError) as e:
-                logger.warning(f"Z値変換失敗: {e}")
+                logger.warning(f"XYZ値変換失敗: {e}")
                 return
-            self._handle_z_value(z)
+            self._handle_xyz(x, y, z)
         else:
             logger.warning(f"valuesが不正: {values!r}")
 
     # ------------------------------------------------------------------
-    # 状態機械（Z軸ベース + Debounce）
+    # 差分メトリクス計算 + 状態機械（Debounce）
     # ------------------------------------------------------------------
 
-    def _handle_z_value(self, z: float) -> None:
-        """1サンプル分のZ値を受けて、着席/離席判定 → Debounceを回す。
+    def _handle_xyz(self, x: float, y: float, z: float) -> None:
+        """XYZ値を受け取り、バッファに追加してメトリクスを計算する。"""
+        with self._state_lock:
+            self._latest_z = z
+            self._sample_buf.append((x, y))
 
-        Z ≥ z_threshold → 着席（スマホが水平＝体重がかかっている）
-        Z < z_threshold → 離席（スマホが傾いている）
+        if len(self._sample_buf) < DIFF_WINDOW_SAMPLES:
+            return
+
+        samples = list(self._sample_buf)
+        total = sum(
+            abs(samples[i][0] - samples[i - 1][0]) + abs(samples[i][1] - samples[i - 1][1])
+            for i in range(1, len(samples))
+        )
+        metric = total / (len(samples) - 1)
+
+        with self._state_lock:
+            self._latest_metric = metric
+
+        self._evaluate_metric(metric)
+
+    def _evaluate_metric(self, metric: float) -> None:
+        """差分メトリクスで着席/離席を判定してDebounceを回す。
+
+        metric ≥ variance_threshold → 着席（体の微小な動きあり）
+        metric <  variance_threshold → 離席（センサー値が静止している）
         """
         cfg = self.config
         now = time.monotonic()
 
         with self._state_lock:
-            self._latest_z = z
-
-            observed = STATUS_SEATED if z >= cfg.z_threshold else STATUS_LEFT
+            observed = STATUS_SEATED if metric >= cfg.variance_threshold else STATUS_LEFT
 
             if now - self._last_status_log_at >= STATUS_LOG_INTERVAL_SEC:
                 self._last_status_log_at = now
                 logger.info(
-                    f"[判定] Z={z:.3f} 閾値={cfg.z_threshold} "
+                    f"[判定] metric={metric:.4f} 閾値={cfg.variance_threshold} "
                     f"observed={observed} confirmed={self._confirmed_state}"
                 )
 
@@ -316,7 +344,7 @@ class SensorMonitor:
                     self._candidate_since = now
                     return
                 if (now - (self._candidate_since or now)) >= cfg.debounce_delay_sec:
-                    self._commit_state(observed, z)
+                    self._commit_state(observed, metric)
                 return
 
             # 確定状態と同じならキャンセル
@@ -329,7 +357,7 @@ class SensorMonitor:
 
             # 確定状態と異なる観測 → 候補として記録
             if self._candidate_state != observed:
-                logger.debug(f"候補状態を更新: {observed} (Z={z:.3f})")
+                logger.debug(f"候補状態を更新: {observed} (metric={metric:.4f})")
                 self._candidate_state = observed
                 self._candidate_since = now
                 return
@@ -337,9 +365,9 @@ class SensorMonitor:
             # 候補が継続中。Debounce時間を満たしたら確定へ昇格
             elapsed = now - (self._candidate_since or now)
             if elapsed >= cfg.debounce_delay_sec:
-                self._commit_state(observed, z)
+                self._commit_state(observed, metric)
 
-    def _commit_state(self, new_state: str, z_value: float) -> None:
+    def _commit_state(self, new_state: str, metric_value: float) -> None:
         """確定処理。state_lock 保有中の前提。"""
         cfg = self.config
         prev = self._confirmed_state
@@ -347,12 +375,12 @@ class SensorMonitor:
         self._candidate_state = None
         self._candidate_since = None
 
-        logger.info(f"状態確定: {prev} -> {new_state} (Z={z_value:.3f})")
+        logger.info(f"状態確定: {prev} -> {new_state} (metric={metric_value:.4f})")
 
         ok = db_models.insert_status(
             cfg.db_path,
             new_state,
-            z_value=z_value,
+            z_value=metric_value,  # DB列をメトリクス値として流用
             note=None,
         )
         if not ok:
