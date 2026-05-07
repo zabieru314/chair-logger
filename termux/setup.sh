@@ -2,15 +2,21 @@
 # 着席検知システム セットアップスクリプト
 #
 # 使い方:
-#   bash termux/setup.sh "https://discord.com/api/webhooks/xxxx/yyyy"
+#   bash termux/setup.sh "https://discord.com/api/webhooks/xxxx/yyyy" [DEBOUNCE秒数]
 #
-# 引数なしで実行すると WEBHOOK_URL は空のままになる（後で .env を手動編集）
+# 例（テスト用に5秒）:
+#   bash termux/setup.sh "https://discord.com/api/webhooks/..." 5
+# 例（本番用に60秒）:
+#   bash termux/setup.sh "https://discord.com/api/webhooks/..." 60
+#
+# 第2引数を省略すると DEBOUNCE_DELAY_SEC=60（デフォルト）
 
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 ENV_FILE="${SCRIPT_DIR}/.env"
 WEBHOOK_URL="${1:-}"
+DEBOUNCE_DELAY_SEC="${2:-60}"
 
 echo "=== 着席検知システム セットアップ ==="
 echo "プロジェクトルート: ${SCRIPT_DIR}"
@@ -20,7 +26,7 @@ cat > "${ENV_FILE}" << EOF
 WEBHOOK_URL=${WEBHOOK_URL}
 
 Z_THRESHOLD=5.0
-DEBOUNCE_DELAY_SEC=60
+DEBOUNCE_DELAY_SEC=${DEBOUNCE_DELAY_SEC}
 MAX_TEMP_CELSIUS=40.0
 COOLDOWN_SLEEP_SEC=300
 TEMP_CHECK_INTERVAL_SEC=60
