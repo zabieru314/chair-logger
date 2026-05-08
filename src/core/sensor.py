@@ -1,17 +1,16 @@
 """
 センサー監視コア
 
-【絶対厳守の設計方針】
-- ポーリング厳禁。`subprocess.run` で繰り返し呼ぶのは熱暴走の原因になるためNG。
-- `termux-sensor -s gravity -d 500` を `subprocess.Popen` で1回だけ起動し、
-  標準出力をストリームとして1行ずつ非同期に読み取る。
-- 重力センサーのZ軸値で着席を判定する。
-    - Z ≥ Z_THRESHOLD → 着席中（スマホが水平 = クッションに押し付けられている）
-    - Z < Z_THRESHOLD → 離席中（スマホが傾いている）
-- 状態が変化してから DEBOUNCE_DELAY_SEC 秒の間その状態が継続した場合のみ
-  「確定」とみなす（チャタリング対策）。
-- 温度監視スレッドが「休止指示」を出している間は、Popen を一旦終了させ、
-  指定秒数 sleep してから再起動する（温度を下げる時間を確保）。
+【設計方針】
+- SENSOR_POLL_INTERVAL_SEC ごとに termux-sensor -s gravity -n 1 で1点取得
+- 前回値との差分 |ΔX|+|ΔY|+|ΔZ| を計算
+- 差分 >= variance_threshold → 着席（動きあり）
+- 差分 <  variance_threshold → 離席候補（DEBOUNCE_LEFT_SEC 継続で確定）
+- 着席候補は DEBOUNCE_DELAY_SEC 継続で確定
+
+【停止方法】
+- stop_event を set するだけ。-n 1 なのでプロセスは自然終了するため
+  SIGINT/pkill は不要。
 """
 
 from __future__ import annotations
@@ -21,25 +20,18 @@ import logging
 import subprocess
 import threading
 import time
-from collections import deque
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Tuple
 
 from src.db import models as db_models
 from src.utils import hardware, notifier
 
 logger = logging.getLogger(__name__)
 
-
-# ステータス定数
 STATUS_SEATED = "seated"
 STATUS_LEFT = "left"
 
-# 状態の定期ログ出力間隔（秒）
-STATUS_LOG_INTERVAL_SEC = 5.0
-
-# 差分メトリクスの計算に使うローリングバッファサイズ（30秒 @500ms）
-DIFF_WINDOW_SAMPLES = 60
+STATUS_LOG_INTERVAL_SEC = 30.0  # ポーリング間隔と合わせて毎回ログ出力
 
 
 @dataclass
@@ -47,26 +39,27 @@ class SensorConfig:
     db_path: str
     webhook_url: Optional[str]
     variance_threshold: float
-    debounce_delay_sec: float
+    debounce_delay_sec: float       # 着席確定までの秒数
+    debounce_left_sec: float        # 離席確定までの秒数（運用時は 300）
     max_temp_celsius: float
     cooldown_sleep_sec: int
     temp_check_interval_sec: float
-    sensor_interval_ms: int = 500
+    sensor_poll_interval_sec: int = 30  # ポーリング間隔（秒）
 
 
 class SensorMonitor:
     """
-    重力センサーのZ軸値をストリームで読み続け、Z値の大小から
-    着席/離席を判定し、Debounce後に状態確定するモニター。
+    重力センサーを SENSOR_POLL_INTERVAL_SEC ごとに 1 点取得し、
+    前回値との差分で着席/離席を判定するモニター。
 
     状態機械:
         confirmed_state : 直近で確定済みの状態（初期値 None）
-        candidate_state : 観測中の遷移候補（None の時は遷移待ちでない）
+        candidate_state : 観測中の遷移候補
         candidate_since : candidate_state を最初に観測した時刻
 
     確定条件:
-        candidate_state が DEBOUNCE_DELAY_SEC 以上継続して観測されたら
-        confirmed_state に昇格させ、DBへ書き込み + Webhook通知。
+        着席候補が debounce_delay_sec 継続 → 着席確定
+        離席候補が debounce_left_sec  継続 → 離席確定
     """
 
     def __init__(self, config: SensorConfig):
@@ -76,10 +69,8 @@ class SensorMonitor:
         self._candidate_state: Optional[str] = None
         self._candidate_since: Optional[float] = None
 
-        self._latest_z: Optional[float] = None
-        self._latest_metric: Optional[float] = None
-        self._sample_buf: deque[tuple[float, float]] = deque(maxlen=DIFF_WINDOW_SAMPLES)
-        self._last_status_log_at: float = 0.0
+        self._latest_delta: Optional[float] = None
+        self._prev_xyz: Optional[Tuple[float, float, float]] = None
 
         self._stop_event = threading.Event()
         self._cooldown_event = threading.Event()
@@ -87,10 +78,9 @@ class SensorMonitor:
 
         self._sensor_thread: Optional[threading.Thread] = None
         self._temp_thread: Optional[threading.Thread] = None
-        self._proc: Optional[subprocess.Popen] = None
 
     # ------------------------------------------------------------------
-    # 公開API
+    # 公開 API
     # ------------------------------------------------------------------
 
     def start(self) -> None:
@@ -115,18 +105,16 @@ class SensorMonitor:
     def stop(self) -> None:
         logger.info("SensorMonitor 停止要求を受信")
         self._stop_event.set()
-        self._terminate_proc()
 
     def get_current_state(self) -> dict:
-        """現在の状態を辞書で返す（Web側から参照される）。"""
         with self._state_lock:
             return {
                 "confirmed_state": self._confirmed_state,
                 "candidate_state": self._candidate_state,
                 "candidate_since": self._candidate_since,
-                "latest_z": self._latest_z,
-                "latest_metric": self._latest_metric,
-                "latest_stddev": self._latest_metric,  # テンプレート互換フィールド
+                "latest_z": None,
+                "latest_metric": self._latest_delta,
+                "latest_stddev": self._latest_delta,
                 "is_cooldown": self._cooldown_event.is_set(),
             }
 
@@ -151,7 +139,6 @@ class SensorMonitor:
                     notifier.notify_overheat(cfg.webhook_url, temp or 0.0, cfg.cooldown_sleep_sec)
 
                     self._cooldown_event.set()
-                    self._terminate_proc()
 
                     waited = 0.0
                     step = 1.0
@@ -171,203 +158,153 @@ class SensorMonitor:
             self._stop_event.wait(cfg.temp_check_interval_sec)
 
     # ------------------------------------------------------------------
-    # センサーループ（Popenでストリーム読み取り）
+    # センサーポーリングループ
     # ------------------------------------------------------------------
 
     def _sensor_loop(self) -> None:
-        logger.info("センサーループ開始")
+        logger.info(
+            f"センサーループ開始（{self.config.sensor_poll_interval_sec}秒ごとにポーリング）"
+        )
         while not self._stop_event.is_set():
             if self._cooldown_event.is_set():
-                time.sleep(1.0)
+                self._stop_event.wait(1.0)
                 continue
 
             try:
-                self._run_sensor_once()
+                self._poll_once()
             except Exception as e:
-                logger.exception(f"センサーループで例外、5秒後にリトライ: {e}")
-                time.sleep(5.0)
+                logger.exception(f"ポーリングで例外、次回まで待機: {e}")
+
+            self._stop_event.wait(self.config.sensor_poll_interval_sec)
+
         logger.info("センサーループ終了")
 
-    def _run_sensor_once(self) -> None:
-        """termux-sensor を1回起動して、終了するまで読み続ける。"""
-        cfg = self.config
-        cmd = ["termux-sensor", "-s", "gravity", "-d", str(cfg.sensor_interval_ms)]
+    def _poll_once(self) -> None:
+        """termux-sensor -n 1 で 1 点取得して差分を計算する。"""
+        xyz = self._get_single_reading()
+        if xyz is None:
+            logger.warning("センサー取得失敗、スキップ")
+            return
 
-        # 前回の残骸リスナーを -c で解放してから起動（pkill は binder を壊すため使わない）
-        try:
-            subprocess.run(["termux-sensor", "-c"], capture_output=True, timeout=5)
-        except Exception:
-            pass
+        x, y, z = xyz
+        logger.info(f"[取得] X={x:.3f} Y={y:.3f} Z={z:.3f}")
 
-        logger.info(f"termux-sensor を起動: {' '.join(cmd)}")
+        with self._state_lock:
+            prev = self._prev_xyz
+            self._prev_xyz = xyz
+
+        if prev is None:
+            logger.info("初回取得。次回ポーリングから差分計算を開始します。")
+            return
+
+        delta = abs(x - prev[0]) + abs(y - prev[1]) + abs(z - prev[2])
+
+        with self._state_lock:
+            self._latest_delta = delta
+
+        logger.info(
+            f"[差分] |ΔX|={abs(x-prev[0]):.3f} |ΔY|={abs(y-prev[1]):.3f} "
+            f"|ΔZ|={abs(z-prev[2]):.3f}  合計={delta:.3f}  閾値={self.config.variance_threshold}"
+        )
+
+        self._evaluate_delta(delta)
+
+    def _get_single_reading(self) -> Optional[Tuple[float, float, float]]:
+        """termux-sensor -n 1 で XYZ を 1 点取得して返す。失敗時は None。"""
         try:
-            self._proc = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+            r = subprocess.run(
+                ["termux-sensor", "-s", "gravity", "-n", "1"],
+                capture_output=True,
                 text=True,
-                bufsize=1,
+                timeout=15,
             )
         except FileNotFoundError:
-            logger.error("termux-sensor コマンドが見つかりません。Termux:API をインストールしてください。")
-            time.sleep(30.0)
-            return
+            logger.error("termux-sensor が見つかりません。Termux:API をインストールしてください。")
+            return None
+        except subprocess.TimeoutExpired:
+            logger.warning("termux-sensor -n 1 がタイムアウト")
+            return None
         except Exception as e:
-            logger.exception(f"termux-sensor 起動失敗: {e}")
-            time.sleep(5.0)
-            return
+            logger.exception(f"termux-sensor 実行失敗: {e}")
+            return None
 
+        if r.stderr.strip():
+            logger.debug(f"[stderr] {r.stderr.strip()[:200]}")
+
+        return self._parse_xyz(r.stdout)
+
+    def _parse_xyz(self, stdout: str) -> Optional[Tuple[float, float, float]]:
+        """stdout から XYZ を抽出して返す。"""
         buf: list[str] = []
         depth = 0
-        line_count = 0
-
-        try:
-            assert self._proc.stdout is not None
-            for line in self._proc.stdout:
-                if self._stop_event.is_set() or self._cooldown_event.is_set():
-                    logger.info("停止/休止指示を検出、Popenを終了します。")
-                    break
-
-                line_count += 1
-
-                if line_count <= 10 or line_count % 100 == 0:
-                    logger.info(f"[センサー生出力 L{line_count}] {line.rstrip()}")
-
-                buf.append(line)
-                depth += line.count("{") - line.count("}")
-                if depth <= 0 and buf:
-                    block = "".join(buf).strip()
-                    buf.clear()
-                    depth = 0
-                    if block:
-                        self._handle_json_block(block)
-
-        except Exception as e:
-            logger.exception(f"センサー出力読み取り中に例外: {e}")
-        finally:
-            try:
-                if self._proc and self._proc.stderr:
-                    err = self._proc.stderr.read()
-                    if err and err.strip():
-                        logger.warning(f"[termux-sensor stderr] {err.strip()}")
-            except Exception:
-                pass
-            self._terminate_proc()
-
-    def _handle_json_block(self, block: str) -> None:
-        """JSONブロックからgravityセンサーのZ値を抽出してハンドラに渡す。"""
-        try:
-            data = json.loads(block)
-        except json.JSONDecodeError as e:
-            logger.debug(f"JSONパース失敗: {e} | block先頭50字: {block[:50]!r}")
-            return
-
-        if not isinstance(data, dict):
-            logger.debug(f"JSON最上位がdictでない: {type(data)}")
-            return
-
-        sensor = None
-        for key in data:
-            if "gravity" in key.lower():
-                sensor = data[key]
-                break
-
-        if not isinstance(sensor, dict):
-            logger.warning(f"gravityキーが見つからない。キー一覧: {list(data.keys())}")
-            return
-
-        values = sensor.get("values")
-        if isinstance(values, list) and len(values) >= 3:
-            try:
-                x = float(values[0])
-                y = float(values[1])
-                z = float(values[2])
-            except (TypeError, ValueError) as e:
-                logger.warning(f"XYZ値変換失敗: {e}")
-                return
-            self._handle_xyz(x, y, z)
-        else:
-            logger.warning(f"valuesが不正: {values!r}")
+        for line in stdout.splitlines():
+            buf.append(line)
+            depth += line.count("{") - line.count("}")
+            if depth <= 0 and buf:
+                block = "\n".join(buf).strip()
+                buf.clear()
+                depth = 0
+                if not block:
+                    continue
+                try:
+                    data = json.loads(block)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(data, dict):
+                    continue
+                for key in data:
+                    if "gravity" in key.lower():
+                        sensor = data[key]
+                        if not isinstance(sensor, dict):
+                            break
+                        values = sensor.get("values")
+                        if isinstance(values, list) and len(values) >= 3:
+                            try:
+                                return (float(values[0]), float(values[1]), float(values[2]))
+                            except (TypeError, ValueError):
+                                pass
+                        break
+        logger.debug(f"XYZ 抽出失敗。stdout先頭: {stdout[:100]!r}")
+        return None
 
     # ------------------------------------------------------------------
-    # 差分メトリクス計算 + 状態機械（Debounce）
+    # 状態機械（Debounce）
     # ------------------------------------------------------------------
 
-    def _handle_xyz(self, x: float, y: float, z: float) -> None:
-        """XYZ値を受け取り、バッファに追加してメトリクスを計算する。"""
-        with self._state_lock:
-            self._latest_z = z
-            self._sample_buf.append((x, y))
-
-        if len(self._sample_buf) < DIFF_WINDOW_SAMPLES:
-            return
-
-        samples = list(self._sample_buf)
-        total = sum(
-            abs(samples[i][0] - samples[i - 1][0]) + abs(samples[i][1] - samples[i - 1][1])
-            for i in range(1, len(samples))
-        )
-        metric = total / (len(samples) - 1)
-
-        with self._state_lock:
-            self._latest_metric = metric
-
-        self._evaluate_metric(metric)
-
-    def _evaluate_metric(self, metric: float) -> None:
-        """差分メトリクスで着席/離席を判定してDebounceを回す。
-
-        metric ≥ variance_threshold → 着席（体の微小な動きあり）
-        metric <  variance_threshold → 離席（センサー値が静止している）
-        """
+    def _evaluate_delta(self, delta: float) -> None:
+        """差分値で着席/離席を判定して Debounce を回す。"""
         cfg = self.config
         now = time.monotonic()
 
         with self._state_lock:
-            observed = STATUS_SEATED if metric >= cfg.variance_threshold else STATUS_LEFT
+            observed = STATUS_SEATED if delta >= cfg.variance_threshold else STATUS_LEFT
+            debounce = cfg.debounce_delay_sec if observed == STATUS_SEATED else cfg.debounce_left_sec
 
-            if now - self._last_status_log_at >= STATUS_LOG_INTERVAL_SEC:
-                self._last_status_log_at = now
-                logger.info(
-                    f"[判定] metric={metric:.4f} 閾値={cfg.variance_threshold} "
-                    f"observed={observed} confirmed={self._confirmed_state}"
-                )
-
-            # 確定状態がまだ無い場合はDebounceをかけて初回確定
-            if self._confirmed_state is None:
-                if self._candidate_state is None:
-                    self._candidate_state = observed
-                    self._candidate_since = now
-                    return
-                if observed != self._candidate_state:
-                    self._candidate_state = observed
-                    self._candidate_since = now
-                    return
-                if (now - (self._candidate_since or now)) >= cfg.debounce_delay_sec:
-                    self._commit_state(observed, metric)
-                return
+            logger.info(
+                f"[判定] delta={delta:.3f} 閾値={cfg.variance_threshold} "
+                f"observed={observed} confirmed={self._confirmed_state} "
+                f"debounce={debounce}s"
+            )
 
             # 確定状態と同じならキャンセル
             if observed == self._confirmed_state:
-                if self._candidate_state is not None:
-                    logger.debug(f"候補状態 {self._candidate_state} をキャンセル（戻った）")
                 self._candidate_state = None
                 self._candidate_since = None
                 return
 
-            # 確定状態と異なる観測 → 候補として記録
+            # 候補が変わったらリセット
             if self._candidate_state != observed:
-                logger.debug(f"候補状態を更新: {observed} (metric={metric:.4f})")
+                logger.debug(f"候補状態を更新: {observed}")
                 self._candidate_state = observed
                 self._candidate_since = now
                 return
 
-            # 候補が継続中。Debounce時間を満たしたら確定へ昇格
+            # 候補が継続中。Debounce 満了で確定
             elapsed = now - (self._candidate_since or now)
-            if elapsed >= cfg.debounce_delay_sec:
-                self._commit_state(observed, metric)
+            if elapsed >= debounce:
+                self._commit_state(observed, delta)
 
-    def _commit_state(self, new_state: str, metric_value: float) -> None:
+    def _commit_state(self, new_state: str, delta: float) -> None:
         """確定処理。state_lock 保有中の前提。"""
         cfg = self.config
         prev = self._confirmed_state
@@ -375,12 +312,12 @@ class SensorMonitor:
         self._candidate_state = None
         self._candidate_since = None
 
-        logger.info(f"状態確定: {prev} -> {new_state} (metric={metric_value:.4f})")
+        logger.info(f"状態確定: {prev} -> {new_state} (delta={delta:.3f})")
 
         ok = db_models.insert_status(
             cfg.db_path,
             new_state,
-            z_value=metric_value,  # DB列をメトリクス値として流用
+            z_value=delta,
             note=None,
         )
         if not ok:
@@ -393,34 +330,3 @@ class SensorMonitor:
                 notifier.notify_left(cfg.webhook_url)
         except Exception as e:
             logger.exception(f"通知ハンドラで例外: {e}")
-
-    # ------------------------------------------------------------------
-    # 後処理
-    # ------------------------------------------------------------------
-
-    def _terminate_proc(self) -> None:
-        """Popen を安全に終了させる。
-        SIGINT を送ることで termux-sensor が Termux:API リスナーを解放してから終了する。
-        SIGTERM/SIGKILL は binder 接続を壊すため使わない。
-        """
-        proc = self._proc
-        self._proc = None
-        if proc is None:
-            return
-        try:
-            if proc.poll() is None:
-                proc.send_signal(__import__("signal").SIGINT)
-                try:
-                    proc.wait(timeout=5.0)
-                except subprocess.TimeoutExpired:
-                    # SIGINT でも終了しない場合のみ SIGKILL（既に壊れている状態）
-                    proc.kill()
-                    proc.wait(timeout=3.0)
-        except Exception as e:
-            logger.exception(f"Popen 終了処理で例外: {e}")
-        finally:
-            # SIGINT 後にも念のりリスナー解放を要求
-            try:
-                subprocess.run(["termux-sensor", "-c"], capture_output=True, timeout=5)
-            except Exception:
-                pass

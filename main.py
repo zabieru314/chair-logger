@@ -157,12 +157,13 @@ def load_config() -> tuple[SensorConfig, dict]:
     sensor_cfg = SensorConfig(
         db_path=db_path,
         webhook_url=os.getenv("WEBHOOK_URL") or None,
-        variance_threshold=_get_float("VARIANCE_THRESHOLD", 0.03),
+        variance_threshold=_get_float("VARIANCE_THRESHOLD", 0.05),
         debounce_delay_sec=_get_float("DEBOUNCE_DELAY_SEC", 5.0),
+        debounce_left_sec=_get_float("DEBOUNCE_LEFT_SEC", 5.0),
         max_temp_celsius=_get_float("MAX_TEMP_CELSIUS", 40.0),
         cooldown_sleep_sec=_get_int("COOLDOWN_SLEEP_SEC", 300),
         temp_check_interval_sec=_get_float("TEMP_CHECK_INTERVAL_SEC", 60.0),
-        sensor_interval_ms=_get_int("SENSOR_INTERVAL_MS", 500),
+        sensor_poll_interval_sec=_get_int("SENSOR_POLL_INTERVAL_SEC", 30),
     )
 
     web_cfg = {
