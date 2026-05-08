@@ -178,8 +178,9 @@ def load_config() -> tuple[SensorConfig, dict]:
 # ---------------------------------------------------------------------------
 
 def main() -> int:
-    # .env 読み込み
-    load_dotenv(dotenv_path=PROJECT_ROOT / ".env")
+    # .env.config（git管理）→ .env（秘密情報）の順に読み込み。後勝ち。
+    load_dotenv(dotenv_path=PROJECT_ROOT / ".env.config", override=False)
+    load_dotenv(dotenv_path=PROJECT_ROOT / ".env", override=True)
 
     log_path = os.getenv("LOG_PATH", "logs/app.log")
     if not os.path.isabs(log_path):
