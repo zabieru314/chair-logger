@@ -10,123 +10,137 @@ Sonnet で誤って開いた場合は即座に再起動する：
 claude --model opus
 ```
 
+---
+
 ## プロジェクト概要
 
 古いAndroidスマホ（Termux環境）で着席・離席を自動検知してDiscordに通知するIoTシステム。
 
 ---
 
-## 【最重要】Termux:API センサーの動作法則（2026-05-08 解明・確認済み）
+## 現在の実装状態（2026-05-08 完了）
 
-### 正しい停止方法（2026-05-08 確定）
+### 検知方式：30秒ポーリング + XYZ差分
 
-```bash
-# Python コードから
-import signal
-proc.send_signal(signal.SIGINT)        # ← SIGINT が正解
-proc.wait(timeout=5)
-subprocess.run(["termux-sensor", "-c"])  # リスナー解放の念押し
+Popen連続ストリームを廃止し、30秒ごとに `termux-sensor -n 1` で1点取得する方式に変更。
+
+```
+delta = |ΔX| + |ΔY| + |ΔZ|  （前回取得値との差分）
+delta >= VARIANCE_THRESHOLD → 着席（動きあり）
+delta <  VARIANCE_THRESHOLD が DEBOUNCE_LEFT_SEC 秒継続 → 離席確定
 ```
 
-SIGINT を受けると termux-sensor は以下を出力して安全に終了する：
+実測値（2026-05-08）:
+- 着席中 delta ≈ 0.10〜0.30（体重移動・呼吸でXYZが揺れる）
+- 離席時（クッションドリフト）delta ≈ 0.006〜0.009
+- 閾値: `VARIANCE_THRESHOLD=0.03`
+
+### 通知の2層構造
+
+| 通知 | タイミング | 送信先 |
+|------|-----------|--------|
+| リアルタイム（着席/離席） | 状態確定ごと | デバッグチャンネル（WEBHOOK_URL） |
+| 日次サマリー | 毎日22:00 | サマリーチャンネル（SUMMARY_WEBHOOK_URL） |
+
+サマリー例：
 ```
-^CCaught interrupt.. Finishing...
-Performing sensor cleanup
-Sensor cleanup successful!
+📊 着席サマリー 5月8日（木）
+09:15 〜 11:45  （2時間30分）
+13:00 〜 15:30  （2時間30分）
+合計着席: 5時間0分
 ```
-
-### 壊れる操作（絶対禁止）
-
-- `proc.terminate()` / `proc.kill()` → SIGTERM/SIGKILL → binder 破壊
-- `pkill -f termux-sensor` → binder 破壊
-
-### binder が壊れたときの復旧（再起動不要）
-
-```bash
-termux-sensor -c          # → "Sensor cleanup successful!" が出れば復旧
-termux-sensor -s "Gravity" -n 1   # 動作確認
-```
-
-`-c` も応答しない場合：設定 → アプリ → アプリ管理 → Termux:API → **強制停止**（GUIから）
-
-### calibrate.py の設計（実装済み）
-
-フェーズごとに `subprocess.run -n 20`（10秒）の独立セッションを使い、
-`finally` ブロックで `termux-sensor -c` を呼んでリスナーを毎回解放する。
-これにより何度でも連続実行できる。
 
 ---
 
-## 【検知方式】差分メトリクス（2026-05-08 変更）
+## デプロイ方針（重要）
 
-Z軸の絶対値閾値はスマホの置き方で逆転する問題があったため、
-**連続サンプル間の変化量**（差分メトリクス）方式に変更した。
+**PC側で編集・push → スマホ側は `git pull` + 再起動のみ。**
+スマホで直接ファイルを編集しない。
 
-### アルゴリズム
+### 設定ファイル構成
+
+| ファイル | git管理 | 用途 |
+|--------|--------|------|
+| `.env.config` | ✅ 管理対象 | 設定値全般（VARIANCE_THRESHOLD等） |
+| `.env` | ❌ gitignore | WEBHOOK_URL のみ（スマホのみに存在） |
+
+設定変更手順：
+1. PC側で `.env.config` を編集
+2. `git push`
+3. スマホで `git pull` → `python main.py` 再起動
+
+### 現在の `.env.config` 設定値
 
 ```
-metric = mean(|ΔX[i] - ΔX[i-1]| + |ΔY[i] - ΔY[i-1]|) over 60 samples (30秒ウィンドウ)
-metric >= VARIANCE_THRESHOLD → 着席（体の微動を検出）
-metric <  VARIANCE_THRESHOLD → 離席（センサーが静止）
+SUMMARY_WEBHOOK_URL=https://discord.com/api/webhooks/1502313121769848892/...
+SUMMARY_TIME=22:00
+VARIANCE_THRESHOLD=0.03
+DEBOUNCE_DELAY_SEC=5        # 着席確定（テスト用・運用は不要）
+DEBOUNCE_LEFT_SEC=300       # 離席確定（5分）
+SENSOR_POLL_INTERVAL_SEC=30 # ポーリング間隔
+MAX_TEMP_CELSIUS=40.0
+COOLDOWN_SLEEP_SEC=300
+TEMP_CHECK_INTERVAL_SEC=60
+FLASK_HOST=0.0.0.0
+FLASK_PORT=8080
 ```
-
-### 実測値（参考）
-- 着席時 metric ≈ 0.10〜0.20（呼吸・体重移動でX/Yが揺れる）
-- 離席時 metric ≈ 0.01〜0.015（クッションのゆっくりした変形ドリフト）
-- デフォルト閾値: `VARIANCE_THRESHOLD=0.03`
-
-### この方式のメリット
-- スマホの置く角度・向きに依存しない
-- クッション下・椅子横など置き場所を選ばない
 
 ---
 
-## calibrate.py の使い方
+## スマホ側での操作（再起動手順）
 
 ```bash
-# main.py が動いていないことを確認してから実行
 cd ~/chair_logger/chair_logger
-python calibrate.py
+git pull
+# Ctrl+C で旧プロセスを止めてから
+python main.py
 ```
-
-1. 着席状態で Enter → 3秒カウントダウン → 10秒収集 → 着席メトリクスが表示される
-2. Enter を押してからその場を離れる → 5秒後に10秒収集 → 離席メトリクスが表示される
-3. **着席メトリクス > 離席メトリクス** なら y で `.env` を自動更新
-4. そのまま `python main.py` を起動できる（再起動不要）
-
-※ デフォルト `VARIANCE_THRESHOLD=0.03` のまま `python main.py` を試してから
-  必要なら calibrate.py でチューニングする方針でもよい。
-
----
-
-## センサー仕様
-
-### センサー名
-- 正式名: `"Gravity Sensor"`（termux-sensor -l で確認）
-- コマンド引数では `"gravity"` または `"Gravity Sensor"` で動作確認済み
-- JSON キー: `"Gravity Sensor"` → コード側は `"gravity" in key.lower()` でマッチ
-
-### Android 15 + OPPO 制限
-- バックグラウンドでのセンサーアクセスはブロックされる
-- Termux がフォアグラウンド（画面オン）の場合は動作する
 
 ---
 
 ## ファイル構成
 
 ```
-main.py              エントリーポイント
-calibrate.py         閾値キャリブレーション（差分メトリクス版）
-src/core/sensor.py   センサー監視コア（差分メトリクス判定）
-src/db/models.py     SQLite操作
-src/utils/notifier.py Discord Webhook通知
+main.py               エントリーポイント + SummaryScheduler
+calibrate.py          閾値キャリブレーション（-n 20 方式）
+.env.config           設定値（git管理対象）
+.env                  WEBHOOK_URL のみ（gitignore・スマホのみ）
+src/core/sensor.py    30秒ポーリング + XYZ差分判定
+src/db/models.py      SQLite操作 + calc_daily_summary
+src/utils/notifier.py Discord通知 + notify_summary
 src/utils/hardware.py 温度監視
-src/web/app.py       Flask WebUI
-.env                 設定値（VARIANCE_THRESHOLD, WEBHOOK_URL等）
+src/web/app.py        Flask WebUI（ポート8080）
 ```
 
+---
+
+## Termux:API センサーの絶対ルール
+
+### -n 1 方式なので SIGINT は不要
+
+`subprocess.run -n 1` はプロセスが自然終了するため SIGINT/SIGTERM/pkill は一切不要。
+
+### binder が壊れたときの復旧（再起動不要）
+
+```bash
+termux-sensor -c                       # → "Sensor cleanup successful!"
+termux-sensor -s "Gravity" -n 1        # 動作確認
+```
+
+`-c` も応答しない場合：設定 → アプリ → Termux:API → **強制停止**（GUIから）
+
+---
+
 ## GitHub リポジトリ
+
 - URL: https://github.com/zabieru314/chair-logger.git
 - ブランチ: main
-- スマホ側: ~/chair_logger/chair_logger/
-- 最新コミット: `b0b65f0`（差分メトリクス方式への切り替え）
+- スマホ側パス: ~/chair_logger/chair_logger/
+- 最新コミット: `a32f6d1`（日次サマリー追加）
+
+---
+
+## センサー仕様
+
+- センサー名: `"Gravity Sensor"`（コードは `"gravity" in key.lower()` でマッチ）
+- Android 15 + OPPO ColorOS：Termux がフォアグラウンド（画面オン）のみセンサーアクセス可
