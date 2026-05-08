@@ -272,37 +272,47 @@ class SensorMonitor:
     # ------------------------------------------------------------------
 
     def _evaluate_delta(self, delta: float) -> None:
-        """差分値で着席/離席を判定して Debounce を回す。"""
+        """差分値で着席/離席を判定して Debounce を回す。
+
+        着席: delta >= threshold で即確定（1回で十分）
+        離席: delta < threshold が debounce_left_sec 継続で確定
+        """
         cfg = self.config
         now = time.monotonic()
 
         with self._state_lock:
             observed = STATUS_SEATED if delta >= cfg.variance_threshold else STATUS_LEFT
-            debounce = cfg.debounce_delay_sec if observed == STATUS_SEATED else cfg.debounce_left_sec
 
             logger.info(
                 f"[判定] delta={delta:.3f} 閾値={cfg.variance_threshold} "
-                f"observed={observed} confirmed={self._confirmed_state} "
-                f"debounce={debounce}s"
+                f"observed={observed} confirmed={self._confirmed_state}"
             )
 
-            # 確定状態と同じならキャンセル
-            if observed == self._confirmed_state:
+            if observed == STATUS_SEATED:
+                # 着席は1回で即確定。確定済みの場合は離席候補をリセットするだけ。
+                if self._confirmed_state != STATUS_SEATED:
+                    self._commit_state(STATUS_SEATED, delta)
                 self._candidate_state = None
                 self._candidate_since = None
                 return
 
-            # 候補が変わったらリセット
-            if self._candidate_state != observed:
-                logger.debug(f"候補状態を更新: {observed}")
-                self._candidate_state = observed
+            # 以下は observed == STATUS_LEFT の処理
+            # 確定済みなら何もしない
+            if self._confirmed_state == STATUS_LEFT:
+                self._candidate_state = None
+                self._candidate_since = None
+                return
+
+            # 離席候補を開始 or 継続
+            if self._candidate_state != STATUS_LEFT:
+                self._candidate_state = STATUS_LEFT
                 self._candidate_since = now
                 return
 
-            # 候補が継続中。Debounce 満了で確定
             elapsed = now - (self._candidate_since or now)
-            if elapsed >= debounce:
-                self._commit_state(observed, delta)
+            logger.info(f"[離席待機] {elapsed:.0f}s / {cfg.debounce_left_sec}s")
+            if elapsed >= cfg.debounce_left_sec:
+                self._commit_state(STATUS_LEFT, delta)
 
     def _commit_state(self, new_state: str, delta: float) -> None:
         """確定処理。state_lock 保有中の前提。"""
