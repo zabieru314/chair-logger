@@ -94,3 +94,31 @@ def notify_startup(webhook_url: Optional[str]) -> bool:
     """システム起動通知。"""
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     return send_webhook(webhook_url, f"[起動] {now} 着席検知システムを起動しました。")
+
+
+def notify_summary(
+    webhook_url: Optional[str],
+    periods: list[tuple[str, str, int]],
+    total_minutes: int,
+    date_str: str,
+) -> bool:
+    """日次サマリー通知。"""
+    from datetime import date as date_cls
+    d = date_cls.fromisoformat(date_str)
+    weekdays = ["月", "火", "水", "木", "金", "土", "日"]
+    label = f"{d.month}月{d.day}日（{weekdays[d.weekday()]}）"
+
+    if not periods:
+        msg = f"📊 着席サマリー {label}\n\n着席記録なし"
+    else:
+        lines = [f"📊 着席サマリー {label}\n"]
+        for start, end, minutes in periods:
+            h, m = divmod(minutes, 60)
+            duration = f"{h}時間{m}分" if h else f"{m}分"
+            lines.append(f"{start} 〜 {end}  （{duration}）")
+        th, tm = divmod(total_minutes, 60)
+        total_str = f"{th}時間{tm}分" if th else f"{tm}分"
+        lines.append(f"\n合計着席: {total_str}")
+        msg = "\n".join(lines)
+
+    return send_webhook(webhook_url, msg, username="ChairLogger Summary")

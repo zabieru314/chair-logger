@@ -132,6 +132,66 @@ def fetch_recent_logs(db_path: str, limit: int = 20) -> list[dict]:
         return []
 
 
+def fetch_today_logs(db_path: str, date_str: str) -> list[dict]:
+    """指定日（YYYY-MM-DD）の全ログを時刻昇順で取得する。"""
+    try:
+        with _connect(db_path) as conn:
+            cursor = conn.execute(
+                "SELECT timestamp, status FROM chair_log "
+                "WHERE timestamp LIKE ? ORDER BY timestamp ASC",
+                (f"{date_str}%",),
+            )
+            return [dict(row) for row in cursor.fetchall()]
+    except sqlite3.Error as e:
+        logger.error(f"DB読み込み失敗: {e}")
+        return []
+    except Exception as e:
+        logger.exception(f"DB読み込みで予期しない例外: {e}")
+        return []
+
+
+def calc_daily_summary(
+    db_path: str, date_str: str, end_dt: datetime
+) -> tuple[list[tuple[str, str, int]], int]:
+    """
+    指定日の着席期間リストと合計分数を返す。
+
+    Returns:
+        periods: [(開始時刻文字列, 終了時刻文字列, 分数), ...]
+        total_minutes: 合計着席分数
+    """
+    logs = fetch_today_logs(db_path, date_str)
+    periods: list[tuple[str, str, int]] = []
+    total_sec = 0
+    seated_start: Optional[datetime] = None
+
+    for row in logs:
+        dt = datetime.fromisoformat(row["timestamp"])
+        if row["status"] == "seated":
+            seated_start = dt
+        elif row["status"] == "left" and seated_start is not None:
+            sec = (dt - seated_start).total_seconds()
+            periods.append((
+                seated_start.strftime("%H:%M"),
+                dt.strftime("%H:%M"),
+                int(sec // 60),
+            ))
+            total_sec += sec
+            seated_start = None
+
+    # まだ着席中の場合: end_dt までカウント
+    if seated_start is not None:
+        sec = (end_dt - seated_start).total_seconds()
+        periods.append((
+            seated_start.strftime("%H:%M"),
+            end_dt.strftime("%H:%M") + "〜",
+            int(sec // 60),
+        ))
+        total_sec += sec
+
+    return periods, int(total_sec // 60)
+
+
 def fetch_latest_status(db_path: str) -> Optional[dict]:
     """
     最新の1件を取得する。レコードが無ければ None。

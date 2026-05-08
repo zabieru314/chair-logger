@@ -148,6 +148,60 @@ def _get_int(name: str, default: int) -> int:
         return default
 
 
+# ---------------------------------------------------------------------------
+# 日次サマリースケジューラー
+# ---------------------------------------------------------------------------
+
+class SummaryScheduler:
+    """毎日 SUMMARY_TIME に日次サマリーを Discord に送信するスレッド。"""
+
+    def __init__(self, db_path: str, summary_webhook_url: str | None, summary_time: str):
+        self.db_path = db_path
+        self.summary_webhook_url = summary_webhook_url
+        self.summary_time = summary_time  # "HH:MM" 形式
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._logger = logging.getLogger(__name__ + ".SummaryScheduler")
+
+    def start(self) -> None:
+        self._thread = threading.Thread(target=self._loop, name="SummaryScheduler", daemon=True)
+        self._thread.start()
+        self._logger.info(f"SummaryScheduler 起動: 毎日 {self.summary_time} に送信")
+
+    def stop(self) -> None:
+        self._stop_event.set()
+
+    def _next_fire(self) -> "datetime":
+        from datetime import datetime, timedelta
+        h, m = map(int, self.summary_time.split(":"))
+        now = datetime.now()
+        target = now.replace(hour=h, minute=m, second=0, microsecond=0)
+        if now >= target:
+            target += timedelta(days=1)
+        return target
+
+    def _loop(self) -> None:
+        from datetime import datetime
+        while not self._stop_event.is_set():
+            target = self._next_fire()
+            wait_sec = (target - datetime.now()).total_seconds()
+            self._logger.info(f"次回サマリー送信: {target.strftime('%Y-%m-%d %H:%M')} （{wait_sec/3600:.1f}時間後）")
+            if self._stop_event.wait(wait_sec):
+                break
+            self._send()
+
+    def _send(self) -> None:
+        from datetime import date, datetime
+        today = date.today().isoformat()
+        now = datetime.now()
+        try:
+            periods, total_min = db_models.calc_daily_summary(self.db_path, today, now)
+            notifier.notify_summary(self.summary_webhook_url, periods, total_min, today)
+            self._logger.info(f"日次サマリー送信完了: {today} 合計{total_min}分")
+        except Exception as e:
+            self._logger.exception(f"日次サマリー送信で例外: {e}")
+
+
 def load_config() -> tuple[SensorConfig, dict]:
     """環境変数から SensorConfig と Flask用設定を構築する。"""
     db_path = os.getenv("DB_PATH", "data/chair_log.db")
@@ -170,7 +224,13 @@ def load_config() -> tuple[SensorConfig, dict]:
         "host": os.getenv("FLASK_HOST", "0.0.0.0"),
         "port": _get_int("FLASK_PORT", 8080),
     }
-    return sensor_cfg, web_cfg
+
+    summary_cfg = {
+        "webhook_url": os.getenv("SUMMARY_WEBHOOK_URL") or os.getenv("WEBHOOK_URL") or None,
+        "time": os.getenv("SUMMARY_TIME", "22:00"),
+    }
+
+    return sensor_cfg, web_cfg, summary_cfg
 
 
 # ---------------------------------------------------------------------------
@@ -192,7 +252,7 @@ def main() -> int:
     logger.info("着席ロガー 起動")
     logger.info("=" * 60)
 
-    sensor_cfg, web_cfg = load_config()
+    sensor_cfg, web_cfg, summary_cfg = load_config()
 
     logger.info(
         f"設定: db={sensor_cfg.db_path} "
@@ -215,6 +275,14 @@ def main() -> int:
     monitor = SensorMonitor(sensor_cfg)
     monitor.start()
 
+    # SummaryScheduler 起動
+    summary_scheduler = SummaryScheduler(
+        db_path=sensor_cfg.db_path,
+        summary_webhook_url=summary_cfg["webhook_url"],
+        summary_time=summary_cfg["time"],
+    )
+    summary_scheduler.start()
+
     # 起動通知（失敗しても続行）
     try:
         notifier.notify_startup(sensor_cfg.webhook_url)
@@ -228,6 +296,7 @@ def main() -> int:
         logger.info(f"シグナル {signum} を受信。終了処理開始")
         stop_event.set()
         monitor.stop()
+        summary_scheduler.stop()
 
     try:
         signal.signal(signal.SIGTERM, _shutdown)
