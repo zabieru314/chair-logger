@@ -196,8 +196,9 @@ def main() -> int:
     logger.info(
         f"設定: db={sensor_cfg.db_path} "
         f"variance_threshold={sensor_cfg.variance_threshold} "
-        f"debounce={sensor_cfg.debounce_delay_sec}s "
-        f"sensor_interval={sensor_cfg.sensor_interval_ms}ms "
+        f"debounce_seated={sensor_cfg.debounce_delay_sec}s "
+        f"debounce_left={sensor_cfg.debounce_left_sec}s "
+        f"poll_interval={sensor_cfg.sensor_poll_interval_sec}s "
         f"max_temp={sensor_cfg.max_temp_celsius}℃ "
         f"cooldown={sensor_cfg.cooldown_sleep_sec}s"
     )
