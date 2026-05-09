@@ -83,6 +83,7 @@ class SensorMonitor:
         self._sensor_thread: Optional[threading.Thread] = None
         self._temp_thread: Optional[threading.Thread] = None
         self._alerted_thresholds: set[int] = set()  # 送信済みバッテリー閾値
+        self._last_battery_check: float = 0.0       # 最後にバッテリーチェックした時刻
 
     # ------------------------------------------------------------------
     # 公開 API
@@ -213,14 +214,20 @@ class SensorMonitor:
         )
 
         self._evaluate_delta(delta)
-        self._check_battery_alert()
 
-    def _check_battery_alert(self) -> None:
+        # 30分ごとの定期バッテリーチェック
+        now = time.monotonic()
+        if now - self._last_battery_check >= 1800:
+            self._last_battery_check = now
+            self._check_battery_alert()
+
+    def _check_battery_alert(self, level: Optional[int] = None) -> None:
         """バッテリー残量が閾値を下回ったらサマリーchに通知（1閾値1回のみ）。"""
         cfg = self.config
         if not cfg.summary_webhook_url:
             return
-        level = hardware.get_battery_level()
+        if level is None:
+            level = hardware.get_battery_level()
         if level is None:
             return
         for threshold in _BATTERY_ALERT_THRESHOLDS:
@@ -360,5 +367,7 @@ class SensorMonitor:
                 notifier.notify_seated(cfg.webhook_url, battery_level)
             else:
                 notifier.notify_left(cfg.webhook_url, battery_level)
+            self._last_battery_check = time.monotonic()
+            self._check_battery_alert(battery_level)
         except Exception as e:
             logger.exception(f"通知ハンドラで例外: {e}")
