@@ -16,13 +16,17 @@ claude --model opus
 
 古いAndroidスマホ（Termux環境）で着席・離席を自動検知してDiscordに通知するIoTシステム。
 
+- スマホ: OPPO（ColorOS 15 / Android 15）
+- Termux + Termux:API でセンサー読み取り
+- Discord Webhook でリアルタイム通知 + 日次サマリー
+
 ---
 
 ## 現在の実装状態（最終更新 2026-05-09）
 
 ### 検知方式：30秒ポーリング + XYZ差分
 
-Popen連続ストリームを廃止し、30秒ごとに `termux-sensor -n 1` で1点取得する方式に変更。
+Popen連続ストリームを廃止し、30秒ごとに `termux-sensor -s gravity -n 1` で1点取得する方式。
 
 ```
 delta = |ΔX| + |ΔY| + |ΔZ|  （前回取得値との差分）
@@ -46,16 +50,26 @@ delta <  VARIANCE_THRESHOLD が DEBOUNCE_LEFT_SEC 秒継続 → 離席確定
 
 | 通知 | タイミング | 送信先 |
 |------|-----------|--------|
-| リアルタイム（着席/離席） | 状態確定ごと | デバッグチャンネル（WEBHOOK_URL） |
+| リアルタイム（起動/着席/離席） | 状態確定ごと | デバッグチャンネル（WEBHOOK_URL） |
 | 日次サマリー | 毎日22:00 | サマリーチャンネル（SUMMARY_WEBHOOK_URL） |
 
-リアルタイム通知にバッテリー残量を追記（2026-05-09）:
+通知例（バッテリー表示つき）:
 ```
+[起動] 2026-05-09 18:07:09 着席検知システムを起動しました。  🔋88%
 [着席] 2026-05-09 10:23:45 作業を開始しました。  🔋82%
 [離席] 2026-05-09 12:47:01 席を離れました。  🔋79%
 ```
-- `hardware.get_battery_level()` → `notifier.notify_seated/notify_left(battery_level=...)` で渡す
-- Termux環境以外では None → バッテリー表示なしで動作継続
+
+バッテリー取得の優先順位（hardware.py）:
+1. `/sys/class/power_supply/battery/capacity`（直読み・Termux:API不要）
+2. `/sys/class/power_supply/mtk-battery/capacity`（MTK系フォールバック）
+3. `/system/bin/cmd battery get level`
+4. `termux-battery-status`（Termux:API 経由・最終手段・タイムアウト15秒）
+
+**バッテリー取得の経緯（2026-05-09）:**
+`termux-battery-status` が Termux:API の binder 経由で失敗し続けていた。
+`/sys/class/power_supply/battery/capacity` は 0444（world-readable）で ADB から 88% を確認。
+Termux ユーザー（untrusted_app_27）からの読み取りも SELinux ログに拒否なし → 動作確認済み。
 
 サマリー例：
 ```
@@ -78,6 +92,9 @@ delta <  VARIANCE_THRESHOLD が DEBOUNCE_LEFT_SEC 秒継続 → 離席確定
 |--------|--------|------|
 | `.env.config` | ✅ 管理対象 | 設定値全般（VARIANCE_THRESHOLD等） |
 | `.env` | ❌ gitignore | WEBHOOK_URL のみ（スマホのみに存在） |
+
+**⚠️ 注意: スマホの `.env` に古い `VARIANCE_THRESHOLD=0.03` が残っていると `.env.config` の 0.07 を上書きしてしまう。**
+`.env` には `WEBHOOK_URL` と `SUMMARY_WEBHOOK_URL` だけ残して他は削除すること。
 
 設定変更手順：
 1. PC側で `.env.config` を編集
@@ -102,7 +119,9 @@ FLASK_PORT=8080
 
 ---
 
-## スマホ側での操作（再起動手順）
+## スマホ側での操作
+
+### 通常の再起動手順
 
 ```bash
 cd ~/chair_logger/chair_logger
@@ -111,19 +130,40 @@ git pull
 python main.py
 ```
 
+### ScreenKeeper のセットアップ（初回のみ・フリップ対策）
+
+**PC側（再起動後に毎回実行）:**
+```bash
+ADB=/mnt/c/Users/zabie/AppData/Local/Android/Sdk/platform-tools/adb.exe
+$ADB tcpip 5555
+```
+
+**スマホ側（初回のみ）:**
+```bash
+pkg update && pkg install android-tools
+adb connect localhost:5555
+# → 承認ポップアップが出たら「常に許可」でOK
+```
+
+**スマホ再起動後の手順:**
+1. USB 繋ぐ
+2. PC から `$ADB tcpip 5555`
+3. Termux で `adb connect localhost:5555`
+4. `python main.py`
+
 ---
 
 ## ファイル構成
 
 ```
-main.py               エントリーポイント + SummaryScheduler
+main.py               エントリーポイント + SummaryScheduler + ScreenKeeper
 calibrate.py          閾値キャリブレーション（-n 20 方式）
 .env.config           設定値（git管理対象）
 .env                  WEBHOOK_URL のみ（gitignore・スマホのみ）
 src/core/sensor.py    30秒ポーリング + XYZ差分判定
 src/db/models.py      SQLite操作 + calc_daily_summary
 src/utils/notifier.py Discord通知 + notify_summary
-src/utils/hardware.py 温度監視
+src/utils/hardware.py バッテリー取得（/sys直読み）+ 温度監視
 src/web/app.py        Flask WebUI（ポート8080）
 ```
 
@@ -154,7 +194,9 @@ termux-sensor -s "Gravity" -n 1        # 動作確認
 - コミット履歴:
   - `a32f6d1` — 日次サマリー追加（2026-05-08）
   - `233485c` — 着席確定バグ修正（1スパイクで即確定、2026-05-09）
-  - ※バッテリー通知・VARIANCE_THRESHOLD=0.07 はまだpush未確認（git push要）
+  - `ba5de3a` — バッテリー通知・画面維持の安定性改善（2026-05-09）
+  - `03aa183` — バッテリー取得多段フォールバック・起動通知にバッテリー追加（2026-05-09）
+  - `fa9c138` — ScreenKeeper 追加（adb localhost:5555 経由の画面常時点灯、2026-05-09）
 
 ---
 
@@ -167,9 +209,39 @@ termux-sensor -s "Gravity" -n 1        # 動作確認
 
 ## 画面オン問題（解決済み・2026-05-09）
 
-ColorOSが画面を強制的に消灯するため、センサーが動作しなくなる。
+ColorOSが画面を強制的に消灯するため、センサーが動作しなくなる問題を段階的に解決した。
 
-### 解決までの経緯（苦戦ポイント）
+### 問題1: 画面タイムアウト（解決済み）
+
+**症状:** 数分で画面が消える  
+**原因:** デフォルトのスクリーンタイムアウト設定  
+**解決:**
+```bash
+$ADB shell settings put system screen_off_timeout 2147483647
+```
+
+### 問題2: USB抜いたら1分で画面オフ（解決済み）
+
+**症状:** USB を抜いた直後から 1 分で画面が消える  
+**原因:** `power_save_screenoff_time_state=1`（OPPO独自の省電力画面オフ）  
+**解決:**
+```bash
+$ADB shell settings put system power_save_screenoff_time_state 0
+```
+
+### 問題3: 裏返しで画面がオフになる可能性（ScreenKeeper で対策済み）
+
+**調査結果:**
+- `pocket_mode_enable` / `oplus_pocket_mode_enabled` など関連キーは全て null（存在しない）
+- `gesture_turn_over_to_mute_enable` も null
+- OPPO ColorOS の近接センサーによる自動消灯は ADB settings では制御不可
+- センサーオフ（Sensors Off）は重力センサーも止まるため使用禁止
+
+**テスト結果（2026-05-09）:** 裏返しても画面が消えないことを確認。  
+ADB 設定（screen_off_timeout + power_save_screenoff_time_state）だけで十分だった可能性が高い。  
+ScreenKeeper は万一の安全網として稼働中（25秒ごとに KEYCODE_WAKEUP 送信）。
+
+### 解決経緯の苦戦ポイント（記事用）
 
 | 試したこと | 結果 | 理由 |
 |-----------|------|------|
@@ -180,106 +252,29 @@ ColorOSが画面を強制的に消灯するため、センサーが動作しな�
 | WSL2から `sudo apt install adb` | sudoパスワード要求でブロック | WSL2はsudoにパスワードが必要 |
 | platform-tools手動DL（Linux版） | `unzip`コマンドなし → Python展開で解決したが権限エラー | chmod +xで解消 |
 | Windows側のadbを使う | **成功** | Android StudioのSDKに `C:\Users\zabie\AppData\Local\Android\Sdk\platform-tools\adb.exe` が存在 |
+| `pocket_mode_enable`等のADB設定 | 全て null（設定キーが存在しない） | OPPO ColorOS 固有機能はADB settings非対応 |
+| `power_save_screenoff_time_state=0` | **成功** | OPPO独自の省電力画面オフを無効化できた |
+| ScreenKeeper（自己ADB方式） | 動作確認済み | Termuxからlocalhost:5555に接続してKEYCODE_WEAKUPを定期送信 |
 
 ### 根本的な詰まりポイント
 
-- **ワイヤレスデバッグかUSBか迷走**：ワイヤレスデバッグを試み続けたが、結局「USBデバッグで全然いい」というユーザー発言でシンプルな方法に気づいた
-- **WSL2はUSBを直接認識しない**：USB接続してもWSL2側のadbでは見えない。Windows側の.exeをWSL2から呼び出すのが正解
-- **設定が効いているか確認が難しい**：元々30分設定だったため「2〜3分のテストでは確認できない」。わざと1分（60000ms）に設定してUSBを抜いてテストする手順で解決
+- **ワイヤレスデバッグかUSBか迷走**: ワイヤレスデバッグを試み続けたが、「USBデバッグで全然いい」という発言でシンプルな方法に気づいた
+- **WSL2はUSBを直接認識しない**: USB接続してもWSL2側のadbでは見えない。Windows側の.exeをWSL2から呼び出すのが正解
+- **設定が効いているか確認が難しい**: 元々30分設定だったため「2〜3分のテストでは確認できない」。わざと1分（60000ms）に設定してUSBを抜いてテストする手順で解決
+- **`power_save_screenoff_time_state` の存在に気づくまで時間がかかった**: `screen_off_timeout=2147483647` を設定済みなのに1分でオフになる原因がわからなかった。全 system 設定を grep して発見
 
-### 最終的な解決方法
+### 再起動後の画面設定コマンド（毎回必要）
 
 ```bash
-# Windows側のadbをWSL2から実行
 ADB=/mnt/c/Users/zabie/AppData/Local/Android/Sdk/platform-tools/adb.exe
-
-# 画面タイムアウトを実質無効化（約596時間）
 $ADB shell settings put system screen_off_timeout 2147483647
-
-# 確認
-$ADB shell settings get system screen_off_timeout  # → 2147483647
-```
-
-動作確認済み（2026-05-09）：
-- ADBで60000（1分）に設定 → USB抜いて1分で画面オフを確認（設定が効いていることを確認）
-- ADBで2147483647に再設定 → 維持されることを確認
-- ColorOSによる自動リセットは発生しなかった
-
-注意：**スマホを再起動すると値がリセットされる可能性あり**。再起動後はUSB繋いで再設定が必要。
-
-### USB抜いても画面オフになる問題（追加調査 2026-05-09）
-
-USB 抜いた直後に 1 分で画面が切れる事象が発生。原因は `power_save_screenoff_time_state=1`（省電力モード時の独自画面オフ）。
-
-```bash
-# 修正コマンド（USB繋いで実行済み）
 $ADB shell settings put system power_save_screenoff_time_state 0
-$ADB shell settings get system power_save_screenoff_time_state  # → 0
+$ADB tcpip 5555   # ScreenKeeper用（スマホ側で adb connect localhost:5555 も必要）
 ```
 
-調査で分かったこと：
-- `screen_off_timeout=2147483647` は維持されていた（ColorOSによるリセットなし）
-- `oplus_customize_smart_apperceive_enabled=0`（スマート認識：無効）
-- `oplus_customize_smart_apperceive_screen_lock=0`（裏返しでロック：無効）
-- 「裏返しで画面オフ」のADB設定は見つからず → OPPO 設定UIの「便利な機能 > フリップ」で確認・無効化が必要
+---
 
-### バッテリー残量通知が表示されない問題（解決 2026-05-09）
-
-`termux-battery-status` が Termux:API binder 経由で失敗 → 通知に `🔋` が表示されなかった。
-
-修正: `src/utils/hardware.py` の `get_battery_level()` を `/sys/class/power_supply/battery/capacity` 直読み優先に変更。
-
-```
-/sys/class/power_supply/battery/capacity  ← 現在 87% を確認
-/sys/class/power_supply/mtk-battery/capacity  ← フォールバック
-```
-
-Termux:API 不要・binder 状態に依存しないため安定動作する。
-
-### 現在の画面オン維持のための設定（全部ADB適用済み）
-
-```bash
-$ADB shell settings put system screen_off_timeout 2147483647          # タイムアウト無効化
-$ADB shell settings put system power_save_screenoff_time_state 0       # 省電力画面オフ無効
-```
-
-スマホ再起動時は上記 2 コマンドの再実行が必要。
-
-### フリップ（裏返し）で画面がオフになる問題の調査結果（2026-05-09）
-
-pocket_mode_enable / oplus_pocket_mode_enabled など ADB 設定キーは全て null（存在しない）。
-OPPO ColorOS の近接センサーによる自動消灯はハードウェア/システムレベルで制御されており、
-ADB settings コマンドでは無効化不可。
-
-→ 解決策: **ScreenKeeper（Termux自己ADB）** を main.py に実装。
-  25秒ごとに `adb -s localhost:5555 shell input keyevent 224`（KEYCODE_WAKEUP）を送信し、
-  画面が消えても即座に復帰させる。
-
-### ScreenKeeper のセットアップ手順
-
-**PC側（再起動後に毎回実行）:**
-```bash
-$ADB tcpip 5555
-```
-
-**スマホ側（初回のみ）:**
-```bash
-pkg update && pkg install android-tools
-adb connect localhost:5555
-# → 承認ポップアップが出たら「常に許可」でOK
-```
-
-**スマホ再起動後:**
-1. USB 繋いで `$ADB tcpip 5555`（PC側）
-2. Termux で `adb connect localhost:5555`
-3. `python main.py`
-
-**注意:**
-- スマホ再起動時は tcpip モードがリセットされる → USB 繋いで PC から再設定が必要
-- `android-tools` がインストールされていない場合は ScreenKeeper が自動無効化（他機能は正常動作）
-- センサーオフ（Sensors Off）は重力センサーも止まるため絶対に使わないこと
-
-### スマホのADB接続情報
+## スマホのADB接続情報
 
 - **接続方式**: USBデバッグ（ワイヤレスデバッグは使わない）
 - **adbパス**: `/mnt/c/Users/zabie/AppData/Local/Android/Sdk/platform-tools/adb.exe`（WSL2から実行）
@@ -294,11 +289,3 @@ adb connect localhost:5555
    ```
    /mnt/c/Users/zabie/AppData/Local/Android/Sdk/platform-tools/adb.exe devices
    ```
-
-### settings書き込みコマンド
-
-```bash
-ADB=/mnt/c/Users/zabie/AppData/Local/Android/Sdk/platform-tools/adb.exe
-$ADB shell settings put system screen_off_timeout 2147483647
-$ADB shell settings get system screen_off_timeout  # → 2147483647 が返ればOK
-```
