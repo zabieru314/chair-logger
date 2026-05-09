@@ -334,9 +334,10 @@ class SensorMonitor:
             logger.error("DB書き込みに失敗しました（通知は継続）")
 
         try:
+            battery_level = hardware.get_battery_level()
             if new_state == STATUS_SEATED:
-                notifier.notify_seated(cfg.webhook_url)
+                notifier.notify_seated(cfg.webhook_url, battery_level)
             else:
-                notifier.notify_left(cfg.webhook_url)
+                notifier.notify_left(cfg.webhook_url, battery_level)
         except Exception as e:
             logger.exception(f"通知ハンドラで例外: {e}")
