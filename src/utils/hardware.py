@@ -90,30 +90,50 @@ def get_battery_temperature() -> Optional[float]:
 def get_battery_level() -> Optional[int]:
     """バッテリー残量（0〜100）を取得する。取得失敗時は None。
 
-    /sys/class/power_supply から直読み（Termux:API 不要・高速）を優先し、
-    失敗した場合のみ termux-battery-status にフォールバックする。
+    優先順位:
+    1. /sys/class/power_supply/battery/capacity（直読み・高速）
+    2. /sys/class/power_supply/mtk-battery/capacity（MTK系フォールバック）
+    3. /system/bin/cmd battery get level（Android cmd 経由）
+    4. termux-battery-status（Termux:API 経由）
     """
-    # /sys から直読み（権限不要・Termux:API の binder 状態に依存しない）
+    # /sys から直読み（世界可読 0444・Termux:API 不要）
     for path in (
         "/sys/class/power_supply/battery/capacity",
         "/sys/class/power_supply/mtk-battery/capacity",
     ):
         try:
             with open(path) as f:
-                return int(f.read().strip())
+                val = int(f.read().strip())
+            logger.debug(f"バッテリー残量取得（{path}）: {val}%")
+            return val
         except Exception:
             pass
 
-    # フォールバック: termux-battery-status
-    status = get_battery_status()
+    # /system/bin/cmd battery get level
+    try:
+        r = subprocess.run(
+            ["/system/bin/cmd", "battery", "get", "level"],
+            capture_output=True, text=True, timeout=5.0, check=False,
+        )
+        val = int(r.stdout.strip())
+        logger.debug(f"バッテリー残量取得（cmd battery）: {val}%")
+        return val
+    except Exception:
+        pass
+
+    # termux-battery-status（最終手段・タイムアウト15秒）
+    status = get_battery_status(timeout_sec=15.0)
     if status is None:
+        logger.warning("バッテリー残量: 全取得方法が失敗。Noneを返します。")
         return None
     pct = status.get("percentage")
     if pct is None:
         logger.warning("termux-battery-status に percentage キーがありません。")
         return None
     try:
-        return int(pct)
+        val = int(pct)
+        logger.debug(f"バッテリー残量取得（termux-battery-status）: {val}%")
+        return val
     except (TypeError, ValueError):
         logger.error(f"残量値の変換に失敗: {pct!r}")
         return None

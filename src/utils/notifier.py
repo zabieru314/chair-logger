@@ -58,16 +58,18 @@ def send_webhook(webhook_url: Optional[str], content: str, username: str = "Chai
         return False
 
 
-def notify_seated(webhook_url: Optional[str]) -> bool:
+def notify_seated(webhook_url: Optional[str], battery_level: Optional[int] = None) -> bool:
     """着席確定時の通知。"""
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    return send_webhook(webhook_url, f"[着席] {now} 作業を開始しました。")
+    batt = f"  🔋{battery_level}%" if battery_level is not None else ""
+    return send_webhook(webhook_url, f"[着席] {now} 作業を開始しました。{batt}")
 
 
-def notify_left(webhook_url: Optional[str]) -> bool:
+def notify_left(webhook_url: Optional[str], battery_level: Optional[int] = None) -> bool:
     """離席確定時の通知。"""
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    return send_webhook(webhook_url, f"[離席] {now} 席を離れました。")
+    batt = f"  🔋{battery_level}%" if battery_level is not None else ""
+    return send_webhook(webhook_url, f"[離席] {now} 席を離れました。{batt}")
 
 
 def notify_overheat(webhook_url: Optional[str], temperature: float, cooldown_sec: int) -> bool:
@@ -90,10 +92,11 @@ def notify_resume(webhook_url: Optional[str], temperature: Optional[float]) -> b
     return send_webhook(webhook_url, msg)
 
 
-def notify_startup(webhook_url: Optional[str]) -> bool:
+def notify_startup(webhook_url: Optional[str], battery_level: Optional[int] = None) -> bool:
     """システム起動通知。"""
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    return send_webhook(webhook_url, f"[起動] {now} 着席検知システムを起動しました。")
+    batt = f"  🔋{battery_level}%" if battery_level is not None else ""
+    return send_webhook(webhook_url, f"[起動] {now} 着席検知システムを起動しました。{batt}")
 
 
 def notify_summary(

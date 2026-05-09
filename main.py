@@ -305,7 +305,10 @@ def main() -> int:
 
     # 起動通知（失敗しても続行）
     try:
-        notifier.notify_startup(sensor_cfg.webhook_url)
+        from src.utils import hardware as _hw
+        _startup_battery = _hw.get_battery_level()
+        logger.info(f"起動時バッテリー: {_startup_battery}%")
+        notifier.notify_startup(sensor_cfg.webhook_url, battery_level=_startup_battery)
     except Exception:
         logger.exception("起動通知で例外（続行）")
 
