@@ -218,6 +218,7 @@ def load_config() -> tuple[SensorConfig, dict]:
         cooldown_sleep_sec=_get_int("COOLDOWN_SLEEP_SEC", 300),
         temp_check_interval_sec=_get_float("TEMP_CHECK_INTERVAL_SEC", 60.0),
         sensor_poll_interval_sec=_get_int("SENSOR_POLL_INTERVAL_SEC", 30),
+        summary_webhook_url=os.getenv("SUMMARY_WEBHOOK_URL") or os.getenv("WEBHOOK_URL") or None,
     )
 
     web_cfg = {

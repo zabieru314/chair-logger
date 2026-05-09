@@ -34,6 +34,9 @@ STATUS_LEFT = "left"
 STATUS_LOG_INTERVAL_SEC = 30.0  # ポーリング間隔と合わせて毎回ログ出力
 
 
+_BATTERY_ALERT_THRESHOLDS = [20, 15, 10]  # 残量アラート閾値（%）
+
+
 @dataclass
 class SensorConfig:
     db_path: str
@@ -45,6 +48,7 @@ class SensorConfig:
     cooldown_sleep_sec: int
     temp_check_interval_sec: float
     sensor_poll_interval_sec: int = 30  # ポーリング間隔（秒）
+    summary_webhook_url: Optional[str] = None  # バッテリーアラート送信先
 
 
 class SensorMonitor:
@@ -78,6 +82,7 @@ class SensorMonitor:
 
         self._sensor_thread: Optional[threading.Thread] = None
         self._temp_thread: Optional[threading.Thread] = None
+        self._alerted_thresholds: set[int] = set()  # 送信済みバッテリー閾値
 
     # ------------------------------------------------------------------
     # 公開 API
@@ -208,6 +213,22 @@ class SensorMonitor:
         )
 
         self._evaluate_delta(delta)
+        self._check_battery_alert()
+
+    def _check_battery_alert(self) -> None:
+        """バッテリー残量が閾値を下回ったらサマリーchに通知（1閾値1回のみ）。"""
+        cfg = self.config
+        if not cfg.summary_webhook_url:
+            return
+        level = hardware.get_battery_level()
+        if level is None:
+            return
+        for threshold in _BATTERY_ALERT_THRESHOLDS:
+            if level <= threshold and threshold not in self._alerted_thresholds:
+                self._alerted_thresholds.add(threshold)
+                msg = f"⚠️ バッテリー残量が {threshold}% 以下になりました（現在 {level}%）"
+                notifier.send_webhook(cfg.summary_webhook_url, msg, username="ChairLogger Alert")
+                logger.warning(f"バッテリーアラート送信: {level}% (閾値{threshold}%)")
 
     def _get_single_reading(self) -> Optional[Tuple[float, float, float]]:
         """termux-sensor -n 1 で XYZ を 1 点取得して返す。失敗時は None。"""
