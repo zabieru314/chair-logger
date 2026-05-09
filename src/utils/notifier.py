@@ -58,18 +58,20 @@ def send_webhook(webhook_url: Optional[str], content: str, username: str = "Chai
         return False
 
 
-def notify_seated(webhook_url: Optional[str], battery_level: Optional[int] = None) -> bool:
+def notify_seated(webhook_url: Optional[str], battery_level: Optional[int] = None, max_delta: Optional[float] = None) -> bool:
     """着席確定時の通知。"""
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     batt = f"  🔋{battery_level}%" if battery_level is not None else ""
-    return send_webhook(webhook_url, f"[着席] {now} 作業を開始しました。{batt}")
+    delta_str = f"  Δ: {max_delta:.3f}" if max_delta is not None else ""
+    return send_webhook(webhook_url, f"[着席] {now} 作業を開始しました。{batt}{delta_str}")
 
 
-def notify_left(webhook_url: Optional[str], battery_level: Optional[int] = None) -> bool:
+def notify_left(webhook_url: Optional[str], battery_level: Optional[int] = None, max_delta: Optional[float] = None) -> bool:
     """離席確定時の通知。"""
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     batt = f"  🔋{battery_level}%" if battery_level is not None else ""
-    return send_webhook(webhook_url, f"[離席] {now} 席を離れました。{batt}")
+    delta_str = f"  Δmax: {max_delta:.3f}" if max_delta is not None else ""
+    return send_webhook(webhook_url, f"[離席] {now} 席を離れました。{batt}{delta_str}")
 
 
 def notify_overheat(webhook_url: Optional[str], temperature: float, cooldown_sec: int) -> bool:

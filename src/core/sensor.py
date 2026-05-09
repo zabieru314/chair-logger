@@ -84,6 +84,7 @@ class SensorMonitor:
         self._temp_thread: Optional[threading.Thread] = None
         self._alerted_thresholds: set[int] = set()  # 送信済みバッテリー閾値
         self._last_battery_check: float = 0.0       # 最後にバッテリーチェックした時刻
+        self._candidate_max_delta: float = 0.0      # 離席候補期間中の最大delta
 
     # ------------------------------------------------------------------
     # 公開 API
@@ -322,6 +323,7 @@ class SensorMonitor:
                     self._commit_state(STATUS_SEATED, delta)
                 self._candidate_state = None
                 self._candidate_since = None
+                self._candidate_max_delta = 0.0
                 return
 
             # 以下は observed == STATUS_LEFT の処理
@@ -335,12 +337,17 @@ class SensorMonitor:
             if self._candidate_state != STATUS_LEFT:
                 self._candidate_state = STATUS_LEFT
                 self._candidate_since = now
+                self._candidate_max_delta = delta
                 return
 
+            # 最大deltaを更新しながら待機
+            if delta > self._candidate_max_delta:
+                self._candidate_max_delta = delta
+
             elapsed = now - (self._candidate_since or now)
-            logger.info(f"[離席待機] {elapsed:.0f}s / {cfg.debounce_left_sec}s")
+            logger.info(f"[離席待機] {elapsed:.0f}s / {cfg.debounce_left_sec}s  Δmax: {self._candidate_max_delta:.3f}")
             if elapsed >= cfg.debounce_left_sec:
-                self._commit_state(STATUS_LEFT, delta)
+                self._commit_state(STATUS_LEFT, self._candidate_max_delta)
 
     def _commit_state(self, new_state: str, delta: float) -> None:
         """確定処理。state_lock 保有中の前提。"""
@@ -349,6 +356,7 @@ class SensorMonitor:
         self._confirmed_state = new_state
         self._candidate_state = None
         self._candidate_since = None
+        self._candidate_max_delta = 0.0
 
         logger.info(f"状態確定: {prev} -> {new_state} (delta={delta:.3f})")
 
@@ -364,9 +372,9 @@ class SensorMonitor:
         try:
             battery_level = hardware.get_battery_level()
             if new_state == STATUS_SEATED:
-                notifier.notify_seated(cfg.webhook_url, battery_level)
+                notifier.notify_seated(cfg.webhook_url, battery_level, delta)
             else:
-                notifier.notify_left(cfg.webhook_url, battery_level)
+                notifier.notify_left(cfg.webhook_url, battery_level, delta)
             self._last_battery_check = time.monotonic()
             self._check_battery_alert(battery_level)
         except Exception as e:
