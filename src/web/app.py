@@ -12,7 +12,7 @@ import os
 from datetime import datetime
 from typing import Optional
 
-from flask import Flask, jsonify, render_template
+from flask import Flask, jsonify, render_template, request
 
 from src.core.sensor import SensorMonitor
 from src.db import models as db_models
@@ -77,6 +77,28 @@ def create_app(db_path: str, monitor: Optional[SensorMonitor] = None) -> Flask:
             return jsonify(logs)
         except Exception as e:
             logger.exception(f"api_logs で例外: {e}")
+            return jsonify({"error": str(e)}), 500
+
+    @app.route("/api/summary/send", methods=["POST"])
+    def api_summary_send():
+        """今日の着席サマリーを即時送信する（テスト・手動トリガー用）。"""
+        import os
+        from datetime import date
+        from src.utils import notifier as _notifier
+        try:
+            today = request.args.get("date") or date.today().isoformat()
+            now = datetime.now()
+            periods, total_min = db_models.calc_daily_summary(db_path, today, now)
+            webhook_url = os.getenv("SUMMARY_WEBHOOK_URL") or os.getenv("WEBHOOK_URL")
+            ok = _notifier.notify_summary(webhook_url, periods, total_min, today)
+            return jsonify({
+                "sent": ok,
+                "date": today,
+                "total_minutes": total_min,
+                "periods": len(periods),
+            })
+        except Exception as e:
+            logger.exception(f"api_summary_send で例外: {e}")
             return jsonify({"error": str(e)}), 500
 
     @app.route("/healthz")
