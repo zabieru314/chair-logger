@@ -49,6 +49,7 @@ class SensorConfig:
     temp_check_interval_sec: float
     sensor_poll_interval_sec: int = 30  # ポーリング間隔（秒）
     summary_webhook_url: Optional[str] = None  # バッテリーアラート送信先
+    daily_goal_minutes: int = 0  # 1日の目標着席分数（0=表示なし）
 
 
 class SensorMonitor:
@@ -351,6 +352,7 @@ class SensorMonitor:
 
     def _commit_state(self, new_state: str, delta: float) -> None:
         """確定処理。state_lock 保有中の前提。"""
+        from datetime import date, datetime as _dt
         cfg = self.config
         prev = self._confirmed_state
         self._confirmed_state = new_state
@@ -371,10 +373,19 @@ class SensorMonitor:
 
         try:
             battery_level = hardware.get_battery_level()
+
+            seated_min = None
+            if cfg.daily_goal_minutes > 0:
+                try:
+                    today = date.today().isoformat()
+                    _, seated_min = db_models.calc_daily_summary(cfg.db_path, today, _dt.now())
+                except Exception:
+                    logger.exception("着席累計取得失敗（通知は継続）")
+
             if new_state == STATUS_SEATED:
-                notifier.notify_seated(cfg.webhook_url, battery_level, delta)
+                notifier.notify_seated(cfg.webhook_url, battery_level, delta, seated_min, cfg.daily_goal_minutes)
             else:
-                notifier.notify_left(cfg.webhook_url, battery_level, delta)
+                notifier.notify_left(cfg.webhook_url, battery_level, delta, seated_min, cfg.daily_goal_minutes)
             self._last_battery_check = time.monotonic()
             self._check_battery_alert(battery_level)
         except Exception as e:

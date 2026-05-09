@@ -219,6 +219,7 @@ def load_config() -> tuple[SensorConfig, dict]:
         temp_check_interval_sec=_get_float("TEMP_CHECK_INTERVAL_SEC", 60.0),
         sensor_poll_interval_sec=_get_int("SENSOR_POLL_INTERVAL_SEC", 30),
         summary_webhook_url=os.getenv("SUMMARY_WEBHOOK_URL") or os.getenv("WEBHOOK_URL") or None,
+        daily_goal_minutes=_get_int("DAILY_GOAL_MINUTES", 0),
     )
 
     web_cfg = {
@@ -381,10 +382,25 @@ def main() -> int:
 
     # 起動通知（失敗しても続行）
     try:
+        from datetime import date as _date, datetime as _dt
         from src.utils import hardware as _hw
         _startup_battery = _hw.get_battery_level()
         logger.info(f"起動時バッテリー: {_startup_battery}%")
-        notifier.notify_startup(sensor_cfg.webhook_url, battery_level=_startup_battery)
+        _startup_seated_min = None
+        if sensor_cfg.daily_goal_minutes > 0:
+            try:
+                _today = _date.today().isoformat()
+                _, _startup_seated_min = db_models.calc_daily_summary(
+                    sensor_cfg.db_path, _today, _dt.now()
+                )
+            except Exception:
+                logger.exception("起動時着席累計取得失敗（通知は継続）")
+        notifier.notify_startup(
+            sensor_cfg.webhook_url,
+            battery_level=_startup_battery,
+            seated_min=_startup_seated_min,
+            goal_min=sensor_cfg.daily_goal_minutes,
+        )
     except Exception:
         logger.exception("起動通知で例外（続行）")
 

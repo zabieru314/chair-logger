@@ -20,6 +20,18 @@ logger = logging.getLogger(__name__)
 DEFAULT_TIMEOUT = 10.0
 
 
+def _progress_str(seated_min: Optional[int], goal_min: int) -> str:
+    """目標進捗文字列を生成する。goal_min=0 または seated_min=None なら空文字。"""
+    if goal_min <= 0 or seated_min is None:
+        return ""
+    h_s, m_s = divmod(seated_min, 60)
+    h_g, m_g = divmod(goal_min, 60)
+    seated_str = f"{h_s}時間{m_s}分" if h_s else f"{m_s}分"
+    goal_str = f"{h_g}時間{m_g}分" if h_g else f"{m_g}分"
+    pct = min(int(seated_min * 100 / goal_min), 100)
+    return f"  ⏱ {seated_str}/{goal_str}（{pct}%）"
+
+
 def send_webhook(webhook_url: Optional[str], content: str, username: str = "ChairLogger") -> bool:
     """
     汎用Webhook送信。
@@ -58,20 +70,22 @@ def send_webhook(webhook_url: Optional[str], content: str, username: str = "Chai
         return False
 
 
-def notify_seated(webhook_url: Optional[str], battery_level: Optional[int] = None, max_delta: Optional[float] = None) -> bool:
+def notify_seated(webhook_url: Optional[str], battery_level: Optional[int] = None, max_delta: Optional[float] = None, seated_min: Optional[int] = None, goal_min: int = 0) -> bool:
     """着席確定時の通知。"""
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     batt = f"  🔋{battery_level}%" if battery_level is not None else ""
     delta_str = f"  Δ: {max_delta:.3f}" if max_delta is not None else ""
-    return send_webhook(webhook_url, f"[着席] {now} 作業を開始しました。{batt}{delta_str}")
+    progress = _progress_str(seated_min, goal_min)
+    return send_webhook(webhook_url, f"[着席] {now} 作業を開始しました。{batt}{delta_str}{progress}")
 
 
-def notify_left(webhook_url: Optional[str], battery_level: Optional[int] = None, max_delta: Optional[float] = None) -> bool:
+def notify_left(webhook_url: Optional[str], battery_level: Optional[int] = None, max_delta: Optional[float] = None, seated_min: Optional[int] = None, goal_min: int = 0) -> bool:
     """離席確定時の通知。"""
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     batt = f"  🔋{battery_level}%" if battery_level is not None else ""
     delta_str = f"  Δmax: {max_delta:.3f}" if max_delta is not None else ""
-    return send_webhook(webhook_url, f"[離席] {now} 席を離れました。{batt}{delta_str}")
+    progress = _progress_str(seated_min, goal_min)
+    return send_webhook(webhook_url, f"[離席] {now} 席を離れました。{batt}{delta_str}{progress}")
 
 
 def notify_overheat(webhook_url: Optional[str], temperature: float, cooldown_sec: int) -> bool:
@@ -94,11 +108,12 @@ def notify_resume(webhook_url: Optional[str], temperature: Optional[float]) -> b
     return send_webhook(webhook_url, msg)
 
 
-def notify_startup(webhook_url: Optional[str], battery_level: Optional[int] = None) -> bool:
+def notify_startup(webhook_url: Optional[str], battery_level: Optional[int] = None, seated_min: Optional[int] = None, goal_min: int = 0) -> bool:
     """システム起動通知。"""
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     batt = f"  🔋{battery_level}%" if battery_level is not None else ""
-    return send_webhook(webhook_url, f"[起動] {now} 着席検知システムを起動しました。{batt}")
+    progress = _progress_str(seated_min, goal_min)
+    return send_webhook(webhook_url, f"[起動] {now} 着席検知システムを起動しました。{batt}{progress}")
 
 
 def notify_summary(
