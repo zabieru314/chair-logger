@@ -87,6 +87,38 @@ def get_battery_temperature() -> Optional[float]:
         return None
 
 
+def get_battery_level() -> Optional[int]:
+    """バッテリー残量（0〜100）を取得する。取得失敗時は None。
+
+    /sys/class/power_supply から直読み（Termux:API 不要・高速）を優先し、
+    失敗した場合のみ termux-battery-status にフォールバックする。
+    """
+    # /sys から直読み（権限不要・Termux:API の binder 状態に依存しない）
+    for path in (
+        "/sys/class/power_supply/battery/capacity",
+        "/sys/class/power_supply/mtk-battery/capacity",
+    ):
+        try:
+            with open(path) as f:
+                return int(f.read().strip())
+        except Exception:
+            pass
+
+    # フォールバック: termux-battery-status
+    status = get_battery_status()
+    if status is None:
+        return None
+    pct = status.get("percentage")
+    if pct is None:
+        logger.warning("termux-battery-status に percentage キーがありません。")
+        return None
+    try:
+        return int(pct)
+    except (TypeError, ValueError):
+        logger.error(f"残量値の変換に失敗: {pct!r}")
+        return None
+
+
 def is_overheating(max_temp_celsius: float) -> tuple[bool, Optional[float]]:
     """
     現在のバッテリー温度が閾値を超えているかを判定する。

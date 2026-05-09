@@ -237,6 +237,23 @@ def load_config() -> tuple[SensorConfig, dict]:
 # main
 # ---------------------------------------------------------------------------
 
+def _acquire_wake_lock() -> None:
+    """termux-wake-lock を取得して CPU スリープを防ぐ。失敗しても続行。"""
+    import shutil
+    import subprocess
+    if shutil.which("termux-wake-lock") is None:
+        return
+    try:
+        subprocess.Popen(
+            ["termux-wake-lock"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        logging.getLogger(__name__).info("termux-wake-lock 取得")
+    except Exception as e:
+        logging.getLogger(__name__).warning(f"termux-wake-lock 起動失敗（続行）: {e}")
+
+
 def main() -> int:
     # .env.config（git管理）→ .env（秘密情報）の順に読み込み。後勝ち。
     load_dotenv(dotenv_path=PROJECT_ROOT / ".env.config", override=False)
@@ -270,6 +287,9 @@ def main() -> int:
     except Exception as e:
         logger.exception(f"DB初期化失敗: {e}")
         return 1
+
+    # CPU スリープ防止（センサー取得中に CPU が落ちないよう）
+    _acquire_wake_lock()
 
     # SensorMonitor 起動
     monitor = SensorMonitor(sensor_cfg)
