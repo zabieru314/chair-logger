@@ -237,6 +237,76 @@ def load_config() -> tuple[SensorConfig, dict]:
 # main
 # ---------------------------------------------------------------------------
 
+class ScreenKeeper:
+    """
+    ADB (localhost:5555) 経由で定期的に KEYCODE_WAKEUP を送信し、
+    画面を常時点灯させる。
+
+    前提: スマホ側で以下が済んでいること
+      1. PC側から `adb tcpip 5555` 実行済み（再起動後は再実行要）
+      2. Termux で `pkg install android-tools` 実行済み
+      3. Termux で `adb connect localhost:5555` 実行済み（初回のみ承認ポップアップあり）
+    """
+
+    WAKE_INTERVAL_SEC = 25
+    ADB_TARGET = "localhost:5555"
+
+    def __init__(self):
+        import shutil
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._logger = logging.getLogger(__name__ + ".ScreenKeeper")
+        self._adb_path = shutil.which("adb")
+
+    def start(self) -> None:
+        if self._adb_path is None:
+            self._logger.info("adb が見つかりません（android-tools未インストール）。ScreenKeeper 無効。")
+            return
+        self._thread = threading.Thread(target=self._loop, name="ScreenKeeper", daemon=True)
+        self._thread.start()
+        self._logger.info(f"ScreenKeeper 起動（{self.WAKE_INTERVAL_SEC}秒ごとに画面ウェイク）")
+
+    def stop(self) -> None:
+        self._stop_event.set()
+
+    def _loop(self) -> None:
+        # 起動直後に一度接続しておく
+        self._reconnect()
+        while not self._stop_event.is_set():
+            self._stop_event.wait(self.WAKE_INTERVAL_SEC)
+            if self._stop_event.is_set():
+                break
+            self._wake()
+
+    def _reconnect(self) -> None:
+        try:
+            import subprocess
+            subprocess.run(
+                [self._adb_path, "connect", self.ADB_TARGET],
+                capture_output=True, timeout=8,
+            )
+        except Exception:
+            pass
+
+    def _wake(self) -> None:
+        import subprocess
+        try:
+            r = subprocess.run(
+                [self._adb_path, "-s", self.ADB_TARGET, "shell", "input", "keyevent", "224"],
+                capture_output=True, text=True, timeout=10,
+            )
+            if r.returncode == 0:
+                self._logger.debug("画面ウェイクアップ送信")
+            else:
+                self._logger.warning(f"ウェイクアップ失敗 (rc={r.returncode}): {r.stderr.strip()[:80]}")
+                self._reconnect()
+        except subprocess.TimeoutExpired:
+            self._logger.warning("adb タイムアウト。再接続試行。")
+            self._reconnect()
+        except Exception as e:
+            self._logger.warning(f"ScreenKeeper 例外: {e}")
+
+
 def _acquire_wake_lock() -> None:
     """termux-wake-lock を取得して CPU スリープを防ぐ。失敗しても続行。"""
     import shutil
@@ -295,6 +365,10 @@ def main() -> int:
     monitor = SensorMonitor(sensor_cfg)
     monitor.start()
 
+    # ScreenKeeper 起動（adb localhost:5555 経由で画面を常時点灯）
+    screen_keeper = ScreenKeeper()
+    screen_keeper.start()
+
     # SummaryScheduler 起動
     summary_scheduler = SummaryScheduler(
         db_path=sensor_cfg.db_path,
@@ -319,6 +393,7 @@ def main() -> int:
         logger.info(f"シグナル {signum} を受信。終了処理開始")
         stop_event.set()
         monitor.stop()
+        screen_keeper.stop()
         summary_scheduler.stop()
 
     try:

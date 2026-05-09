@@ -245,6 +245,40 @@ $ADB shell settings put system power_save_screenoff_time_state 0       # 省電�
 
 スマホ再起動時は上記 2 コマンドの再実行が必要。
 
+### フリップ（裏返し）で画面がオフになる問題の調査結果（2026-05-09）
+
+pocket_mode_enable / oplus_pocket_mode_enabled など ADB 設定キーは全て null（存在しない）。
+OPPO ColorOS の近接センサーによる自動消灯はハードウェア/システムレベルで制御されており、
+ADB settings コマンドでは無効化不可。
+
+→ 解決策: **ScreenKeeper（Termux自己ADB）** を main.py に実装。
+  25秒ごとに `adb -s localhost:5555 shell input keyevent 224`（KEYCODE_WAKEUP）を送信し、
+  画面が消えても即座に復帰させる。
+
+### ScreenKeeper のセットアップ手順
+
+**PC側（再起動後に毎回実行）:**
+```bash
+$ADB tcpip 5555
+```
+
+**スマホ側（初回のみ）:**
+```bash
+pkg update && pkg install android-tools
+adb connect localhost:5555
+# → 承認ポップアップが出たら「常に許可」でOK
+```
+
+**スマホ再起動後:**
+1. USB 繋いで `$ADB tcpip 5555`（PC側）
+2. Termux で `adb connect localhost:5555`
+3. `python main.py`
+
+**注意:**
+- スマホ再起動時は tcpip モードがリセットされる → USB 繋いで PC から再設定が必要
+- `android-tools` がインストールされていない場合は ScreenKeeper が自動無効化（他機能は正常動作）
+- センサーオフ（Sensors Off）は重力センサーも止まるため絶対に使わないこと
+
 ### スマホのADB接続情報
 
 - **接続方式**: USBデバッグ（ワイヤレスデバッグは使わない）
