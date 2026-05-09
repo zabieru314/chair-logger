@@ -46,12 +46,13 @@ delta <  VARIANCE_THRESHOLD が DEBOUNCE_LEFT_SEC 秒継続 → 離席確定
 **着席確定バグ修正（commit 233485c）:**
 初期実装では2回連続スパイクが必要だったが、スパイクは2〜3分に1回程度しか来ないため永遠に着席確定しなかった。1回スパイクで即確定に変更して解決。
 
-### 通知の2層構造
+### 通知の3層構造
 
 | 通知 | タイミング | 送信先 |
 |------|-----------|--------|
 | リアルタイム（起動/着席/離席） | 状態確定ごと | デバッグチャンネル（WEBHOOK_URL） |
-| 日次サマリー | 毎日22:00 | サマリーチャンネル（SUMMARY_WEBHOOK_URL） |
+| 日次サマリー | 毎日22:00（手動トリガー可） | サマリーチャンネル（SUMMARY_WEBHOOK_URL） |
+| バッテリーアラート | 着席/離席時 + 30分ごと | サマリーチャンネル（SUMMARY_WEBHOOK_URL） |
 
 通知例（バッテリー表示つき）:
 ```
@@ -78,6 +79,41 @@ Termux ユーザー（untrusted_app_27）からの読み取りも SELinux ログ
 13:00 〜 15:30  （2時間30分）
 合計着席: 5時間0分
 ```
+
+### バッテリーアラート（2026-05-09追加）
+
+閾値：20% / 15% / 10%（各1回のみ・再起動でリセット）
+
+```
+⚠️ バッテリー残量が 20% 以下になりました（現在 19%）
+```
+
+チェックタイミング：着席/離席確定時 + 30分ごと（毎ポーリング30秒はやりすぎのため）
+
+実装ポイント（sensor.py）：
+- `SensorConfig.summary_webhook_url` を追加
+- `SensorMonitor._alerted_thresholds: set[int]` でメモリ管理
+- `SensorMonitor._last_battery_check: float` で30分タイマー管理
+- `_commit_state()` でバッテリー取得済みの値を再利用して `_check_battery_alert(level)` に渡す
+
+### サマリー手動送信（2026-05-09追加）
+
+Flask に `POST /api/summary/send` エンドポイントを追加。PCのターミナルから即時送信できる。
+
+```bash
+# 今日のサマリーを送信
+curl -X POST http://192.168.10.104:8080/api/summary/send
+
+# 日付指定（過去分）
+curl -X POST "http://192.168.10.104:8080/api/summary/send?date=2026-05-08"
+```
+
+レスポンス例：
+```json
+{"sent": true, "date": "2026-05-09", "total_minutes": 124, "periods": 10}
+```
+
+末尾に `〜` がつく期間（例: `17:56 〜 18:48〜`）は「まだ着席中」を意味する（まだ `left` が記録されていない）。
 
 ---
 
@@ -160,11 +196,11 @@ main.py               エントリーポイント + SummaryScheduler + ScreenKee
 calibrate.py          閾値キャリブレーション（-n 20 方式）
 .env.config           設定値（git管理対象）
 .env                  WEBHOOK_URL のみ（gitignore・スマホのみ）
-src/core/sensor.py    30秒ポーリング + XYZ差分判定
+src/core/sensor.py    30秒ポーリング + XYZ差分判定 + バッテリーアラート
 src/db/models.py      SQLite操作 + calc_daily_summary
 src/utils/notifier.py Discord通知 + notify_summary
 src/utils/hardware.py バッテリー取得（/sys直読み）+ 温度監視
-src/web/app.py        Flask WebUI（ポート8080）
+src/web/app.py        Flask WebUI（ポート8080）+ /api/summary/send
 ```
 
 ---
@@ -197,6 +233,11 @@ termux-sensor -s "Gravity" -n 1        # 動作確認
   - `ba5de3a` — バッテリー通知・画面維持の安定性改善（2026-05-09）
   - `03aa183` — バッテリー取得多段フォールバック・起動通知にバッテリー追加（2026-05-09）
   - `fa9c138` — ScreenKeeper 追加（adb localhost:5555 経由の画面常時点灯、2026-05-09）
+  - `6497a94` — VARIANCE_THRESHOLD を 0.03→0.07 に修正（git push 漏れを解消、2026-05-09）
+  - `d416c4c` — 着席・離席通知にバッテリー残量を追加（sensor.py コミット漏れ修正、2026-05-09）
+  - `7244f76` — サマリー即時送信エンドポイント追加（POST /api/summary/send、2026-05-09）
+  - `da21e64` — バッテリー残量アラート追加（20%/15%/10%、サマリーch送信、2026-05-09）
+  - `2acda9c` — バッテリーアラートを30分ごと+着席/離席時のみに変更（2026-05-09）
 
 ---
 
