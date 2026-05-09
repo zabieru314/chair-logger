@@ -325,9 +325,10 @@ def _acquire_wake_lock() -> None:
 
 
 def main() -> int:
-    # .env.config（git管理）→ .env（秘密情報）の順に読み込み。後勝ち。
-    load_dotenv(dotenv_path=PROJECT_ROOT / ".env.config", override=False)
-    load_dotenv(dotenv_path=PROJECT_ROOT / ".env", override=True)
+    # .env（秘密情報）→ .env.config（設定値）の順に読み込み。.env.config が常に勝つ。
+    # .env には WEBHOOK_URL 等の秘密情報のみ置き、設定値は .env.config で一元管理する。
+    load_dotenv(dotenv_path=PROJECT_ROOT / ".env", override=False)
+    load_dotenv(dotenv_path=PROJECT_ROOT / ".env.config", override=True)
 
     log_path = os.getenv("LOG_PATH", "logs/app.log")
     if not os.path.isabs(log_path):
