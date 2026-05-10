@@ -138,30 +138,22 @@ class SensorMonitor:
             return
 
         cfg = self.config
+        _alerted_overheat = False  # 連続通知を防ぐフラグ
         while not self._stop_event.is_set():
             try:
                 over, temp = hardware.is_overheating(cfg.max_temp_celsius)
                 if over:
-                    logger.warning(
-                        f"温度上限超過: {temp}℃ >= {cfg.max_temp_celsius}℃。"
-                        f"{cfg.cooldown_sleep_sec}秒の休止に入ります。"
-                    )
-                    notifier.notify_overheat(cfg.webhook_url, temp or 0.0, cfg.cooldown_sleep_sec)
-
-                    self._cooldown_event.set()
-
-                    waited = 0.0
-                    step = 1.0
-                    while waited < cfg.cooldown_sleep_sec and not self._stop_event.is_set():
-                        time.sleep(step)
-                        waited += step
-
-                    self._cooldown_event.clear()
-                    notifier.notify_resume(cfg.webhook_url, hardware.get_battery_temperature())
-                    logger.info("休止終了。センサー監視を再開します。")
+                    logger.warning(f"温度上限超過: {temp}℃ >= {cfg.max_temp_celsius}℃")
+                    if not _alerted_overheat:
+                        # サマリーchに通知（センサーは止めない）
+                        msg = f"🌡️ バッテリー温度が {temp:.1f}℃ に達しました。充電器を外すか涼しい場所に移してください。"
+                        notifier.send_webhook(cfg.summary_webhook_url or cfg.webhook_url, msg, username="ChairLogger Alert")
+                        _alerted_overheat = True
                 else:
                     if temp is not None:
                         logger.debug(f"バッテリー温度: {temp:.1f}℃")
+                    if _alerted_overheat and temp is not None and temp < cfg.max_temp_celsius - 2.0:
+                        _alerted_overheat = False  # 2℃下がったらリセット（再通知可能に）
             except Exception as e:
                 logger.exception(f"温度監視ループで例外: {e}")
 
