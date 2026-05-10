@@ -164,9 +164,69 @@ FLASK_PORT=8080
 
 ---
 
-## スマホ側での操作
+## PC側からの完全リモート操作（USB接続時）
 
-### 通常の再起動手順
+### 【重要】ADB input text のスペース問題
+
+`adb shell input text` はスペースで文字列が分断される。スペースは `keyevent 62` で送る。
+
+```bash
+ADB=/mnt/c/Users/zabie/AppData/Local/Android/Sdk/platform-tools/adb.exe
+
+# スペースを挟んだコマンドの入力例: "python main.py"
+$ADB shell input text 'python'
+$ADB shell input keyevent 62      # スペース
+$ADB shell input text 'main.py'
+$ADB shell input keyevent 66      # Enter
+```
+
+### PC側からの再起動手順（全作業をPCだけで完結）
+
+```bash
+ADB=/mnt/c/Users/zabie/AppData/Local/Android/Sdk/platform-tools/adb.exe
+
+# 1. USB接続確認
+$ADB devices
+
+# 2. 画面設定（再起動後は毎回必要）
+$ADB shell settings put system screen_off_timeout 2147483647
+$ADB shell settings put system power_save_screenoff_time_state 0
+$ADB tcpip 5555
+
+# 3. Ctrl+Z でフォアグラウンドのmain.pyをサスペンド
+$ADB shell input keycombination 113 54
+
+# 4. サスペンドを確認してからkill
+$ADB shell input text 'kill %1'
+$ADB shell input keyevent 66
+
+# 5. .envを更新（新しいWebhook URLをsdcardに置いてからコピー）
+# 先に chair_env.tmp を C:\Users\zabie\FreelanceChats\503_着席検知システム\chair_env.tmp に書いてpush
+# $ADB push "C:\...\chair_env.tmp" /sdcard/chair_env.tmp
+$ADB shell input text 'cp'
+$ADB shell input keyevent 62
+$ADB shell input text '/sdcard/chair_env.tmp'
+$ADB shell input keyevent 62
+$ADB shell input text '.env'
+$ADB shell input keyevent 66
+
+# 6. git pull
+$ADB shell input text 'git'
+$ADB shell input keyevent 62
+$ADB shell input text 'pull'
+$ADB shell input keyevent 66
+sleep 8
+
+# 7. main.py 起動
+$ADB shell input text 'python'
+$ADB shell input keyevent 62
+$ADB shell input text 'main.py'
+$ADB shell input keyevent 66
+```
+
+**前提**: main.pyがTermuxのフォアグラウンドで動いていること（通常の起動状態）。バックグラウンドで動いている場合は `fg` で前面に出してからCtrl+Z。
+
+### スマホ側での操作（手動の場合）
 
 ```bash
 cd ~/chair_logger/chair_logger
