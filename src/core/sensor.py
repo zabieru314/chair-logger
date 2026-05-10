@@ -50,6 +50,7 @@ class SensorConfig:
     sensor_poll_interval_sec: int = 30  # ポーリング間隔（秒）
     summary_webhook_url: Optional[str] = None  # バッテリーアラート送信先
     daily_goal_minutes: int = 0  # 1日の目標着席分数（0=表示なし）
+    seated_confirm_window_sec: float = 300.0  # 2スパイク確認のウィンドウ（秒）
 
 
 class SensorMonitor:
@@ -86,6 +87,7 @@ class SensorMonitor:
         self._alerted_thresholds: set[int] = set()  # 送信済みバッテリー閾値
         self._last_battery_check: float = 0.0       # 最後にバッテリーチェックした時刻
         self._candidate_max_delta: float = 0.0      # 離席候補期間中の最大delta
+        self._seated_candidate_since: Optional[float] = None  # 着席1スパイク目の時刻
 
     # ------------------------------------------------------------------
     # 公開 API
@@ -319,12 +321,46 @@ class SensorMonitor:
             )
 
             if observed == STATUS_SEATED:
-                # 着席は1回で即確定。確定済みの場合は離席候補をリセットするだけ。
-                if self._confirmed_state != STATUS_SEATED:
-                    self._commit_state(STATUS_SEATED, delta)
-                self._candidate_state = None
-                self._candidate_since = None
-                self._candidate_max_delta = 0.0
+                if self._confirmed_state == STATUS_SEATED:
+                    # すでに着席中 → 離席候補をリセットするだけ
+                    self._candidate_state = None
+                    self._candidate_since = None
+                    self._candidate_max_delta = 0.0
+                    return
+
+                # 2スパイク確認ロジック
+                if self._seated_candidate_since is None:
+                    # 1スパイク目
+                    self._seated_candidate_since = now
+                    self._candidate_state = None
+                    self._candidate_since = None
+                    self._candidate_max_delta = 0.0
+                    logger.info(
+                        f"[着席候補] 1スパイク目 delta={delta:.3f}"
+                        f"（{cfg.seated_confirm_window_sec:.0f}秒以内の2スパイク目で確定）"
+                    )
+                    return
+
+                elapsed_candidate = now - self._seated_candidate_since
+                if elapsed_candidate > cfg.seated_confirm_window_sec:
+                    # ウィンドウ期限切れ → 今回を新たな1スパイク目として扱う
+                    self._seated_candidate_since = now
+                    self._candidate_state = None
+                    self._candidate_since = None
+                    self._candidate_max_delta = 0.0
+                    logger.info(
+                        f"[着席候補] ウィンドウ期限切れ({elapsed_candidate:.0f}s)"
+                        f"→リセット。新たな1スパイク目 delta={delta:.3f}"
+                    )
+                    return
+
+                # 2スパイク目（ウィンドウ内）→ 着席確定
+                logger.info(
+                    f"[着席候補] 2スパイク目 delta={delta:.3f}"
+                    f"（{elapsed_candidate:.0f}秒後）→ 着席確定"
+                )
+                self._seated_candidate_since = None
+                self._commit_state(STATUS_SEATED, delta)
                 return
 
             # 以下は observed == STATUS_LEFT の処理
@@ -359,6 +395,7 @@ class SensorMonitor:
         self._candidate_state = None
         self._candidate_since = None
         self._candidate_max_delta = 0.0
+        self._seated_candidate_since = None
 
         logger.info(f"状態確定: {prev} -> {new_state} (delta={delta:.3f})")
 

@@ -220,6 +220,7 @@ def load_config() -> tuple[SensorConfig, dict]:
         sensor_poll_interval_sec=_get_int("SENSOR_POLL_INTERVAL_SEC", 30),
         summary_webhook_url=os.getenv("SUMMARY_WEBHOOK_URL") or os.getenv("WEBHOOK_URL") or None,
         daily_goal_minutes=_get_int("DAILY_GOAL_MINUTES", 0),
+        seated_confirm_window_sec=_get_float("SEATED_CONFIRM_WINDOW_SEC", 300.0),
     )
 
     web_cfg = {
