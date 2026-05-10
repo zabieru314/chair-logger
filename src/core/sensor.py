@@ -51,6 +51,7 @@ class SensorConfig:
     summary_webhook_url: Optional[str] = None  # バッテリーアラート送信先
     daily_goal_minutes: int = 0  # 1日の目標着席分数（0=表示なし）
     seated_confirm_window_sec: float = 300.0  # 2スパイク確認のウィンドウ（秒）
+    screen_off_alert_count: int = 3          # 連続失敗N回でスクリーンオフアラート
 
 
 class SensorMonitor:
@@ -88,6 +89,8 @@ class SensorMonitor:
         self._last_battery_check: float = 0.0       # 最後にバッテリーチェックした時刻
         self._candidate_max_delta: float = 0.0      # 離席候補期間中の最大delta
         self._seated_candidate_since: Optional[float] = None  # 着席1スパイク目の時刻
+        self._consecutive_failures: int = 0   # センサー連続失敗カウント
+        self._screen_off_alerted: bool = False  # 画面オフアラート送信済みフラグ
 
     # ------------------------------------------------------------------
     # 公開 API
@@ -185,8 +188,32 @@ class SensorMonitor:
         """termux-sensor -n 1 で 1 点取得して差分を計算する。"""
         xyz = self._get_single_reading()
         if xyz is None:
-            logger.warning("センサー取得失敗、スキップ")
+            self._consecutive_failures += 1
+            logger.warning(f"センサー取得失敗、スキップ（連続{self._consecutive_failures}回）")
+            cfg = self.config
+            if (cfg.screen_off_alert_count > 0
+                    and self._consecutive_failures >= cfg.screen_off_alert_count
+                    and not self._screen_off_alerted):
+                msg = f"📵 センサーが{self._consecutive_failures}回連続で取得できません。画面がオフになっている可能性があります。"
+                notifier.send_webhook(
+                    cfg.summary_webhook_url or cfg.webhook_url,
+                    msg,
+                    username="ChairLogger Alert",
+                )
+                self._screen_off_alerted = True
+                logger.warning("画面オフアラートを送信しました")
             return
+
+        # センサー復旧 → 画面オフ状態から復帰
+        if self._screen_off_alerted:
+            notifier.send_webhook(
+                self.config.summary_webhook_url or self.config.webhook_url,
+                "✅ センサーが復旧しました。画面がオンになりました。",
+                username="ChairLogger Alert",
+            )
+            self._screen_off_alerted = False
+            logger.info("センサー復旧通知を送信しました")
+        self._consecutive_failures = 0
 
         x, y, z = xyz
         logger.info(f"[取得] X={x:.3f} Y={y:.3f} Z={z:.3f}")
