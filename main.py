@@ -274,25 +274,38 @@ class ScreenKeeper:
         self._stop_event.set()
 
     def _loop(self) -> None:
-        # 起動直後に一度接続しておく
-        self._reconnect()
+        if not self._reconnect():
+            self._logger.info(
+                "ADB localhost:5555 に接続できません。ScreenKeeper無効化"
+                "（termux-wake-lock に依存します）。"
+            )
+            return
+        fail_count = 0
         while not self._stop_event.is_set():
             self._stop_event.wait(self.WAKE_INTERVAL_SEC)
             if self._stop_event.is_set():
                 break
-            self._wake()
+            if self._wake():
+                fail_count = 0
+            else:
+                fail_count += 1
+                if fail_count >= 3:
+                    self._logger.info("ADB接続が切断されました。ScreenKeeper停止。")
+                    return
+                self._reconnect()
 
-    def _reconnect(self) -> None:
+    def _reconnect(self) -> bool:
         try:
             import subprocess
-            subprocess.run(
+            r = subprocess.run(
                 [self._adb_path, "connect", self.ADB_TARGET],
-                capture_output=True, timeout=8,
+                capture_output=True, text=True, timeout=8,
             )
+            return "connected" in r.stdout.lower() or "already connected" in r.stdout.lower()
         except Exception:
-            pass
+            return False
 
-    def _wake(self) -> None:
+    def _wake(self) -> bool:
         import subprocess
         try:
             r = subprocess.run(
@@ -301,14 +314,16 @@ class ScreenKeeper:
             )
             if r.returncode == 0:
                 self._logger.debug("画面ウェイクアップ送信")
+                return True
             else:
-                self._logger.warning(f"ウェイクアップ失敗 (rc={r.returncode}): {r.stderr.strip()[:80]}")
-                self._reconnect()
+                self._logger.debug(f"ウェイクアップ失敗 (rc={r.returncode}): {r.stderr.strip()[:80]}")
+                return False
         except subprocess.TimeoutExpired:
-            self._logger.warning("adb タイムアウト。再接続試行。")
-            self._reconnect()
+            self._logger.debug("adb タイムアウト")
+            return False
         except Exception as e:
-            self._logger.warning(f"ScreenKeeper 例外: {e}")
+            self._logger.debug(f"ScreenKeeper 例外: {e}")
+            return False
 
 
 def _acquire_wake_lock() -> None:
