@@ -20,7 +20,7 @@ from src.db import models as db_models
 logger = logging.getLogger(__name__)
 
 
-def create_app(db_path: str, monitor: Optional[SensorMonitor] = None) -> Flask:
+def create_app(db_path: str, monitor: Optional[SensorMonitor] = None, variance_threshold: float = 0.0) -> Flask:
     """
     Flask アプリを生成する。
 
@@ -99,6 +99,25 @@ def create_app(db_path: str, monitor: Optional[SensorMonitor] = None) -> Flask:
             })
         except Exception as e:
             logger.exception(f"api_summary_send で例外: {e}")
+            return jsonify({"error": str(e)}), 500
+
+    @app.route("/api/delta")
+    def api_delta():
+        """直近のdelta値履歴を返す（診断用）。PCからcurlで確認可能。"""
+        try:
+            history = monitor.get_delta_history() if monitor else []
+            state = monitor.get_current_state() if monitor else {}
+            return jsonify({
+                "threshold": variance_threshold,
+                "confirmed_state": state.get("confirmed_state"),
+                "candidate_state": state.get("candidate_state"),
+                "latest_delta": state.get("latest_metric"),
+                "history_count": len(history),
+                "history": history[-20:],  # 直近20件のみ返す
+                "generated_at": datetime.now().isoformat(timespec="seconds"),
+            })
+        except Exception as e:
+            logger.exception(f"api_delta で例外: {e}")
             return jsonify({"error": str(e)}), 500
 
     @app.route("/healthz")

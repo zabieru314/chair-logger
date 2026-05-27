@@ -91,6 +91,7 @@ class SensorMonitor:
         self._seated_candidate_since: Optional[float] = None  # 着席1スパイク目の時刻
         self._consecutive_failures: int = 0   # センサー連続失敗カウント
         self._screen_off_alerted: bool = False  # 画面オフアラート送信済みフラグ
+        self._delta_history: list[tuple[float, float]] = []  # (monotonic_time, delta) 直近60件
 
     # ------------------------------------------------------------------
     # 公開 API
@@ -130,6 +131,14 @@ class SensorMonitor:
                 "latest_stddev": self._latest_delta,
                 "is_cooldown": self._cooldown_event.is_set(),
             }
+
+    def get_delta_history(self) -> list[dict]:
+        """直近最大60件の delta 取得履歴を返す。診断用。"""
+        with self._state_lock:
+            return [
+                {"t": t, "delta": round(d, 4)}
+                for t, d in self._delta_history
+            ]
 
     # ------------------------------------------------------------------
     # 温度監視ループ
@@ -230,6 +239,9 @@ class SensorMonitor:
 
         with self._state_lock:
             self._latest_delta = delta
+            self._delta_history.append((time.monotonic(), delta))
+            if len(self._delta_history) > 60:
+                self._delta_history.pop(0)
 
         logger.info(
             f"[差分] |ΔX|={abs(x-prev[0]):.3f} |ΔY|={abs(y-prev[1]):.3f} "
@@ -347,7 +359,15 @@ class SensorMonitor:
                     self._candidate_max_delta = 0.0
                     return
 
-                # 2スパイク確認ロジック
+                # 起動後の初回確定（confirmed_state=None）は1スパイクで即確定
+                # 理由: 2スパイク確認では、起動直後に着席状態に入れないケースが多い
+                if self._confirmed_state is None:
+                    logger.info(f"[着席] 初回確定（1スパイク） delta={delta:.3f}")
+                    self._seated_candidate_since = None
+                    self._commit_state(STATUS_SEATED, delta)
+                    return
+
+                # 2スパイク確認ロジック（left確定後の着席復帰）
                 if self._seated_candidate_since is None:
                     # 1スパイク目
                     self._seated_candidate_since = now

@@ -428,7 +428,7 @@ def main() -> int:
     kill_by_pidfile(pid_file)
     kill_by_ps("main.py")
     write_pidfile(pid_file)
-    app = create_app(sensor_cfg.db_path, monitor=monitor)
+    app = create_app(sensor_cfg.db_path, monitor=monitor, variance_threshold=sensor_cfg.variance_threshold)
     try:
         logger.info(f"Flask 起動: http://{web_cfg['host']}:{web_cfg['port']}/")
         app.run(
