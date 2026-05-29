@@ -290,7 +290,7 @@ class ScreenKeeper:
             else:
                 fail_count += 1
                 if fail_count >= 3:
-                    self._logger.info("ADB接続が切断されました。ScreenKeeper停止。")
+                    self._logger.debug("ADB接続が切断されました。ScreenKeeper停止。")
                     return
                 self._reconnect()
 
@@ -316,7 +316,7 @@ class ScreenKeeper:
                 self._logger.debug("画面ウェイクアップ送信")
                 return True
             else:
-                self._logger.debug(f"ウェイクアップ失敗 (rc={r.returncode}): {r.stderr.strip()[:80]}")
+                self._logger.debug(f"ウェイクアップ失敗 (rc={r.returncode}): {r.stderr.strip()[:80] or r.stdout.strip()[:80]}")
                 return False
         except subprocess.TimeoutExpired:
             self._logger.debug("adb タイムアウト")
